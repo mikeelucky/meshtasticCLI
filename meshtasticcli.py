@@ -890,7 +890,7 @@ class MeshApp(App):
         except Exception:
             pass
 
-    def _refresh_log(self):
+    def _refresh_log(self, force: bool = False):
         log = self.query_one("#log", RichLog)
         msgs = self.store.get(self.current_channel)
         self.store.mark_read(self.current_channel)
@@ -903,11 +903,26 @@ class MeshApp(App):
             log.write(Text(f"  — channel #{self.current_channel} is empty —", style=C["ghost"]))
             return
 
-        if lines_count <= 1:
+       
+        if force or lines_count <= 1:
+            log.clear()
+            for m in msgs:
+                self._write_msg(log, m)
+            return
+
+ 
+        last_msg_changed = False
+        if msgs and lines_count > 0:
+        
+            if msgs[-1].get("is_own"):
+                last_msg_changed = True
+
+        if last_msg_changed:
             log.clear()
             for m in msgs:
                 self._write_msg(log, m)
         else:
+ 
             delta = len(msgs) - lines_count
             if delta > 0:
                 for m in msgs[-delta:]:
@@ -1156,7 +1171,7 @@ class MeshApp(App):
     def _send_message(self, text: str):
         if self.current_channel in ("system", "debug"):
             self.store.add("system", "sys", f"Error: Cannot send messages in #{self.current_channel} channel.")
-            self._refresh_log()
+            self._refresh_log(force=True)
             return
 
         if self.current_channel.startswith("▶"):
@@ -1167,7 +1182,7 @@ class MeshApp(App):
                 self.store._apply_late_ack(pid, entry)
             else:
                 self.store.add(self.current_channel, "sys", "DM sending failed.")
-            self._refresh_log()
+            self._refresh_log(force=True)
             return
 
         ch_index = 0
