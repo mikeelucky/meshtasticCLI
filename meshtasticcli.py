@@ -60,14 +60,21 @@ class Database:
 
     def _init_db(self):
         with self.conn:
-            # Таблица настроек
+            
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
-            # Таблица сообщений (каналы и личные чаты)
+         
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    node_id TEXT PRIMARY KEY,
+                    label   TEXT
+                )
+            """)
+    
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +88,7 @@ class Database:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Таблица сырых входящих/исходящих пакетов
+      
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS packets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +97,22 @@ class Database:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+    def add_favorite(self, node_id: str, label: str):
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO favorites (node_id, label) VALUES (?, ?)",
+                (node_id, label)
+            )
+
+    def remove_favorite(self, node_id: str):
+        with self.conn:
+            self.conn.execute("DELETE FROM favorites WHERE node_id = ?", (node_id,))
+
+    def get_favorites(self) -> dict:
+        """Возвращает {node_id: label}"""
+        cur = self.conn.execute("SELECT node_id, label FROM favorites")
+        return {row["node_id"]: row["label"] for row in cur.fetchall()}
 
     def get_setting(self, key: str) -> Optional[str]:
         cur = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
@@ -201,7 +224,7 @@ class MessageStore:
             for row in history:
                 timestamp_str = row["timestamp"]
                 
-                # Конвертируем SQLite UTC время в Московское (UTC+3)
+           
                 try:
                     dt_utc = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                     dt_msc = dt_utc.astimezone(MOSCOW_TZ)
@@ -261,7 +284,7 @@ class MessageStore:
         pid = int(packet_id)
         entry = self.pending_acks.get(pid)
         if entry:
-            if entry["ack"] != "ack":  # don't downgrade
+            if entry["ack"] != "ack":  
                 entry["ack"] = status
                 entry["ack_detail"] = detail
             return True
@@ -344,15 +367,19 @@ class MeshInterface:
         self.my_id = "!local"
         self.my_name = "operator"
         self.nodes: dict = {}
+        self._excluded_nodes: set = set()        
         self.connected = False
         self.channel_names: dict[int, str] = {0: "primary"}
         self.app_channels_callback = None
         self.app_dm_callback = None
 
     def _refresh_nodes(self) -> None:
-        """Синхронизирует кэш нод из интерфейса Meshtastic без автоматической фильтрации."""
+   
         if self.iface and hasattr(self.iface, "nodes") and self.iface.nodes:
-            self.nodes = dict(self.iface.nodes)
+            self.nodes = {
+                k: v for k, v in self.iface.nodes.items()
+                if str(k) not in self._excluded_nodes
+            }
 
     def connect_serial(self, port: str) -> bool:
         try:
@@ -669,6 +696,8 @@ class MeshApp(App):
         self.ch_index = 0
         self._nodes_visible = True
         self._update_pending = False
+        # Загружаем избранные ноды из БД
+        self._favorites: dict[str, str] = db.get_favorites()  # {node_id: label}
 
     @property
     def current_channel(self) -> str:
@@ -705,13 +734,13 @@ class MeshApp(App):
                 yield RichLog(id="log", wrap=True, highlight=False, markup=True)
                 with Horizontal(id="input-row"):
                     yield Static(f"[{C['accent']}]mesh ›[/{C['accent']}] ", id="prompt", markup=True)
-                    yield Input(placeholder="type msg, :dm <name/id> or :nodeclean <days>", id="msg-input")
+                    yield Input(placeholder="type msg, :dm <name/id> or :help", id="msg-input")
             yield NodePanel(self.mesh, id="node-col")
         yield Static("", id="statusbar")
 
     def _header_art(self) -> str:
         logo = f"[bold {C['hi']}]▰▰ meshtastic cli client[/bold {C['hi']}]"
-        mode = f"[{C['accent']}]⟁ AUTONOMOUS SQLITE-MODE[/{C['accent']}]"
+        mode = f"[{C['accent']}]⟁ AUTONOMOUS MODE[/{C['accent']}]"
         manifest = f"[{C['ghost']}]no internet · no servers · no gods[/{C['ghost']}]"
         return f" {logo} │ {mode} ── {manifest}"
 
@@ -1055,35 +1084,64 @@ class MeshApp(App):
             self.store.add("system", "sys", "Ошибка: устройство не подключено.")
             return
 
+        local_node = getattr(self.mesh.iface, "localNode", None)
+        if local_node is None:
+            self.store.add("system", "sys", "Ошибка: localNode недоступен.")
+            return
+
         current_time = time.time()
         max_age_seconds = days * 86400
         removed_count = 0
+        failed_count = 0
 
-        # Получаем список ID нод для проверки
         node_ids = list(self.mesh.iface.nodes.keys())
-        
+
         for node_id in node_ids:
-            # Не удаляем собственную ноду
             if str(node_id) == str(self.mesh.my_id):
                 continue
-                
-            node_data = self.mesh.iface.nodes[node_id]
-            if isinstance(node_data, dict):
-                last_heard = node_data.get("lastHeard", 0)
-                
-                # Если нода "молчит" дольше положенного времени — стираем её из API интерфейса
-                if last_heard > 0 and (current_time - last_heard) > max_age_seconds:
-                    del self.mesh.iface.nodes[node_id]
-                    removed_count += 1
+            # Не трогаем избранные ноды
+            if str(node_id) in self._favorites:
+                continue
 
-        # Обновляем локальный кэш приложения и перерисовываем панель
+            node_data = self.mesh.iface.nodes[node_id]
+            if not isinstance(node_data, dict):
+                continue
+
+            last_heard = node_data.get("lastHeard", 0)
+            if last_heard <= 0 or (current_time - last_heard) <= max_age_seconds:
+                continue
+
+           
+            node_num = node_data.get("num")
+            if node_num is None:
+                
+                try:
+                    str_id = str(node_id)
+                    node_num = int(str_id.lstrip("!"), 16)
+                except (ValueError, AttributeError):
+                    self.store.add("system", "sys", f"  ✗ не удалось определить nodeNum для {node_id}")
+                    failed_count += 1
+                    continue
+
+            try:
+                local_node.removeNode(node_num)
+                self.store.add("system", "sys", f"  → removeNode({node_num}) sent for {node_id}")
+                self.mesh._excluded_nodes.add(str(node_id))
+                if node_id in self.mesh.iface.nodes:
+                    del self.mesh.iface.nodes[node_id]
+                removed_count += 1
+            except Exception as e:
+                self.store.add("system", "sys", f"  ✗ ошибка удаления {node_id}: {e}")
+                failed_count += 1
+
+       
         self.mesh._refresh_nodes()
         self._refresh_nodes()
-        
-        self.store.add(
-            "system", "sys", 
-            f"✓ Очистка завершена. Удалено нод, молчавших более {days} дн.: {removed_count}"
-        )
+
+        msg = f"✓ Очистка завершена. Удалено нод (молчали > {days} дн.): {removed_count}"
+        if failed_count:
+            msg += f"  |  ошибок: {failed_count}"
+        self.store.add("system", "sys", msg)
 
     def on_input_submitted(self, event: Input.Submitted):
         text = event.value.strip()
@@ -1187,22 +1245,127 @@ class MeshApp(App):
             self.store.add("system", "sys", "=== node table ===")
             self._node_index_map = {}
             idx = 1
+            now = time.time()
 
             for nid, info in self.mesh.nodes.items():
                 str_nid = str(nid)
-                if isinstance(info, dict):
-                    u = info.get("user", info)
-                    name = u.get("longName", str_nid[-6:])
-                    snr_val = info.get("snr", "?")
-                    hops = info.get("hopsAway", "?")
+                if not isinstance(info, dict):
+                    continue
 
-                    self._node_index_map[str(idx)] = str_nid
-                    self.store.add(
-                        "system", "sys",
-                        f" [{idx}] {name:<18} id:{str_nid[-8:]}  snr:{snr_val}  hops:{hops}"
-                    )
-                    idx += 1
+                u = info.get("user", info)
+                name = u.get("longName", str_nid[-6:])
+                hw_model = u.get("hwModel", "?")
+                role = u.get("role", "?")
 
+                snr_val = info.get("snr", "?")
+                hops = info.get("hopsAway", "?")
+
+           
+                pos = info.get("position", {})
+                lat = pos.get("latitude") or pos.get("latitudeI")
+                lon = pos.get("longitude") or pos.get("longitudeI")
+                if lat and lon:
+                    if abs(lat) > 180:
+                        lat = lat * 1e-7
+                        lon = lon * 1e-7
+                    pos_str = f"{lat:.4f},{lon:.4f}"
+                else:
+                    pos_str = "no gps"
+
+             
+                last_heard = info.get("lastHeard", 0)
+                if last_heard and last_heard > 0:
+                    age_sec = int(now - last_heard)
+                    if age_sec < 60:
+                        heard_str = f"{age_sec}s ago"
+                    elif age_sec < 3600:
+                        heard_str = f"{age_sec // 60}m ago"
+                    elif age_sec < 86400:
+                        heard_str = f"{age_sec // 3600}h ago"
+                    else:
+                        heard_str = f"{age_sec // 86400}d ago"
+                else:
+                    heard_str = "never"
+
+                self._node_index_map[str(idx)] = str_nid
+                self.store.add(
+                    "system", "sys",
+                    f" [{idx}] {name:<20} id:{str_nid[-8:]}"
+                    f"  snr:{snr_val}  hops:{hops}"
+                    f"  hw:{hw_model}  role:{role}"
+                    f"  pos:{pos_str}  heard:{heard_str}"
+                )
+                idx += 1
+
+            self.ch_index = self.channels.index("system")
+            self.query_one("#log", RichLog).clear()
+            self._refresh_log()
+
+        elif verb == "addfav" and args:
+            target = args[0].strip()
+            resolved_id = None
+            label = "?"
+
+           
+            if hasattr(self, "_node_index_map") and target in self._node_index_map:
+                resolved_id = self._node_index_map[target]
+
+  
+            if not resolved_id:
+                for nid, info in self.mesh.nodes.items():
+                    str_nid = str(nid)
+                    if target.lstrip("!") in str_nid.lstrip("!"):
+                        resolved_id = str_nid
+                        break
+
+       
+            if not resolved_id:
+                for nid, info in self.mesh.nodes.items():
+                    if isinstance(info, dict):
+                        ln = info.get("user", {}).get("longName", "")
+                        if ln.lower() == target.lower():
+                            resolved_id = str(nid)
+                            break
+
+            if not resolved_id:
+                self.store.add("system", "sys", f"✗ addfav: нода не найдена: {target}")
+                self._refresh_log()
+                return
+
+  
+            node_info = self.mesh.nodes.get(resolved_id, {})
+            if isinstance(node_info, dict):
+                label = node_info.get("user", {}).get("longName", resolved_id)
+
+            self._favorites[resolved_id] = label
+            db.add_favorite(resolved_id, label)
+            self.store.add("system", "sys", f"★ Добавлено в избранное: {label} ({resolved_id})")
+            self._refresh_log()
+
+        elif verb == "delfav" and args:
+            target = args[0].strip()
+
+            found_id = None
+            for fid, flabel in self._favorites.items():
+                if target.lstrip("!") in fid.lstrip("!") or target.lower() == flabel.lower():
+                    found_id = fid
+                    break
+            if not found_id:
+                self.store.add("system", "sys", f"✗ delfav: не найдено в избранном: {target}")
+            else:
+                label = self._favorites.pop(found_id)
+                db.remove_favorite(found_id)
+                self.store.add("system", "sys", f"✩ Удалено из избранного: {label} ({found_id})")
+            self._refresh_log()
+
+        elif verb == "favs":
+            favs = self._favorites
+            if not favs:
+                self.store.add("system", "sys", "★ Избранных нод нет.")
+            else:
+                self.store.add("system", "sys", f"★ Избранные ноды ({len(favs)}):")
+                for fid, flabel in favs.items():
+                    self.store.add("system", "sys", f"   {flabel:<20} {fid}")
             self.ch_index = self.channels.index("system")
             self.query_one("#log", RichLog).clear()
             self._refresh_log()
@@ -1265,9 +1428,12 @@ class MeshApp(App):
             (":nodes",           "list all active mesh nodes details"),
             (":clear",           "clear current log window"),
             (":help",            "this message"),
+            (":addfav <name/id/idx>", "add node to favorite"),
+            (":delfav <name/id>",     "remove favorite node"),
+            (":favs",                 "show favorite nodes"),
             (":q",               "quit"),
             ("ctrl+n",           "next channel"),
-            ("ctrl+p",           "previous channel"),
+            ("ctrl+p",           "main menu"),
             ("ctrl+x",           "close current DM tab"),
             ("ctrl+d",           "toggle node sidebar"),
             ("ctrl+l",           "clear log"),
