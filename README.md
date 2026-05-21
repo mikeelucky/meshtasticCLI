@@ -4,6 +4,8 @@ A minimalist, cyberpunk-styled Text User Interface (TUI) messenger for off-grid 
 ![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen1.png)
 ![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen2.png)
 ![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen3.png)
+![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen4.png)
+![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen5.png)
 
 Минималистичный терминальный (TUI) мессенджер для работы с автономными радиосетями Meshtastic, написанный на Python с использованием фреймворка Textual.
 
