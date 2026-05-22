@@ -2,7 +2,8 @@
 
 A minimalist, cyberpunk-styled Text User Interface (TUI) messenger for off-grid Meshtastic hardware networks, built with Python and the Textual framework.
 ![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen6.png)
-![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen7.png)
+![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen8.png)
+![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen9.png)
 ![Meshtastic TUI Screenshot](https://raw.githubusercontent.com/mikeelucky/meshtasticCLI/refs/heads/main/screen3.png)
 
 
@@ -30,13 +31,10 @@ Don't want to install Python? Go to the **Releases** section of this repository 
    cd meshtastic-tui
    pip install meshtastic textual rich
    python3 meshtasticcli.py # or launch .exe
-   In the app type :tcp 192.168.x.x — the address of your node on the local network for connecting to a node
-   ### ⌨️ TUI Commands Reference
+
 All control commands start with a colon (`:`):
 :help Help
-* `:nodes` — Scans the mesh network, lists all active stations in the main log, and assigns them a quick-access index number `[1]`, `[2]`, etc.
-* `:dm <index/name/node_id>` — Opens a private messaging tab for the selected target. Supports full names with spaces and short list indices (e.g., `:dm 2` or `:dm Base Station`).
-* `Click/Enter` (on input field) — Send message to the currently active channel or private tab.
+etc
 
 ---
 ## Русский
@@ -57,12 +55,9 @@ All control commands start with a colon (`:`):
    cd meshtastic-tui
    pip install meshtastic textual rich
    python3 meshtasticcli.py # или запуск .exe
-   В самом приложении напишите :tcp 192.168.x.x - адрес вашей ноды в локальной сети для подключения к ней.
-   ### ⌨️ Справочник консольных команд
+
 Управление интерфейсом и навигация осуществляются через встроенные команды (начинаются с `:`):
 :help - Отобразить справку
-* `:nodes` — Опрашивает память меш-модема, выводит список активных нод в главный лог и присваивает каждой станции короткий порядковый номер `[1]`, `[2]` и т.д.
-* `:dm <индекс/имя/ID_ноды>` — Создает и открывает отдельную вкладку приватного чата с указанным узлом. Поддерживает имена с пробелами и быстрый вызов по индексу (например, `:dm 2` или `:dm Полевой Скаут`).
-* `Ввод текста` (в строке ввода) — Отправка сообщения в текущую активную вкладку общего канала или приватного DM.
+и так далее
 
 ---
