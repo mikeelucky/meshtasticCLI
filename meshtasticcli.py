@@ -60,7 +60,6 @@ class Database:
 
     def _init_db(self):
         with self.conn:
-            
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -158,16 +157,29 @@ class Database:
 db = Database()
 
 
-def find_node_by_name(interface, name: str) -> Optional[str]:
-    """Find node ID by shortName or longName (case-insensitive)."""
-    if not interface.nodes:
-        return None
-    for node_id, node_data in interface.nodes.items():
-        user_info = node_data.get("user", {})
-        if (user_info.get("longName", "").lower() == name.lower() or 
-            user_info.get("shortName", "").lower() == name.lower()):
-            return str(node_id)
-    return None
+def _normalize_node_id(raw: str) -> str:
+    """Convert any node id form to !hexid.
+    Accepts: decimal int string '181026860', '!0aca402c', '0aca402c'.
+    Returns: '!0aca402c'
+    """
+    if not raw:
+        return raw
+    s = str(raw).strip()
+    if s.startswith("!"):
+        return s.lower()
+   
+    try:
+        n = int(s)
+        return f"!{n:08x}"
+    except ValueError:
+        pass
+ 
+    try:
+        int(s, 16)
+        return f"!{s.lower()}"
+    except ValueError:
+        pass
+    return s
 
 
 def ts() -> str:
@@ -187,7 +199,7 @@ def snr_bar(snr: float) -> str:
     try:
         level = max(0, min(7, int((float(snr) + 5) / 3)))
     except (ValueError, TypeError):
-        level = 0
+        return f"[{C['ghost']}]?[/{C['ghost']}]"
 
     if snr >= 8:   col = C["accent"]
     elif snr >= 3: col = C["warn"]
@@ -224,7 +236,6 @@ class MessageStore:
             for row in history:
                 timestamp_str = row["timestamp"]
                 
-           
                 try:
                     dt_utc = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                     dt_msc = dt_utc.astimezone(MOSCOW_TZ)
@@ -372,9 +383,10 @@ class MeshInterface:
         self.channel_names: dict[int, str] = {0: "primary"}
         self.app_channels_callback = None
         self.app_dm_callback = None
+        self._ping_sessions: dict[int, tuple] = {}
+        self._traceroute_sessions: dict[int, tuple] = {}
 
     def _refresh_nodes(self) -> None:
-   
         if self.iface and hasattr(self.iface, "nodes") and self.iface.nodes:
             self.nodes = {
                 k: v for k, v in self.iface.nodes.items()
@@ -438,12 +450,34 @@ class MeshInterface:
         if hasattr(self, 'on_update') and self.on_update:
             self.on_update()
 
+    def _on_connect(self, interface, topic=pub.AUTO_TOPIC):
+        self.connected = True
+        self.store.add("system", "sys", "link established")
+        self._refresh_nodes()
+        self.on_update()
+
     def _on_recv(self, packet, interface):
         self._refresh_nodes()
 
         decoded = packet.get("decoded", {})
         text = decoded.get("text", "")
+        portnum = decoded.get("portnum", "")
+        sender_id_raw = str(packet.get("fromId", ""))
+        sender_norm = _normalize_node_id(sender_id_raw) if sender_id_raw else ""
 
+        # ── REPLY_APP pong (незашифрованные каналы) ──────────────────────────
+        is_reply_app = (portnum == "REPLY_APP" or portnum == 32)
+        if is_reply_app:
+            self._handle_pong(packet, sender_norm)
+            return
+
+        # ── TRACEROUTE_APP response ───────────────────────────────────────────
+        is_traceroute = (portnum == "TRACEROUTE_APP" or portnum == 70)
+        if is_traceroute:
+            self._handle_traceroute(packet, sender_norm)
+            return
+
+        # ── ROUTING (ACK/NAK) ────────────────────────────────────────────────
         routing = decoded.get("routing")
         if routing is not None:
             req_id = packet.get("requestId") or decoded.get("requestId")
@@ -451,21 +485,36 @@ class MeshInterface:
                 error = routing.get("errorReason", "NONE")
                 if isinstance(error, int):
                     error = "NONE" if error == 0 else str(error)
-                if error in (None, "NONE", 0, "0"):
-                    found = self.store.set_ack(req_id, "ack")
+                is_ok = error in (None, "NONE", 0, "0")
+
+                if is_ok and req_id in self._ping_sessions:
+                    self._handle_pong(packet, sender_norm, via_ack=True, req_id=req_id)
+                elif is_ok:
+                    self.store.set_ack(req_id, "ack")
                 else:
-                    found = self.store.set_ack(req_id, "nack", error)
+                    if req_id in self._ping_sessions:
+                        _, _, ping_tab = self._ping_sessions.pop(req_id)
+                        self.store.add(ping_tab, "~ ping", f"✗ NAK: {error}")
+                        if self.app_dm_callback:
+                            self.app_dm_callback(ping_tab)
+                    else:
+                        self.store.set_ack(req_id, "nack", error)
                 self.on_update()
             if hasattr(self, "app") and self.app:
                 self.app.call_from_thread(self.app._force_refresh_log)
             return
 
+        # ── нет текста — дамп в debug ────────────────────────────────────────
         if not text:
+            self.store.add("debug", "raw",
+                f"[no-text pkt] portnum={portnum!r} from={sender_id_raw} "
+                f"reqId={packet.get('requestId')} decoded_keys={list(decoded.keys())}",
+                is_raw_debug=True)
             self.on_update()
             return
 
+        # ── текстовое сообщение ──────────────────────────────────────────────
         raw_to_id = packet.get("toId")
-        sender_id = str(packet.get("fromId", "!unknown"))
         to_id = str(raw_to_id if raw_to_id is not None else "^all")
         rssi = packet.get("rxRssi")
         snr  = packet.get("rxSnr")
@@ -477,8 +526,8 @@ class MeshInterface:
                 hops_away = hop_start - hop_limit
 
         is_broadcast = (
-            to_id.startswith("^") or 
-            to_id == "4294967295" or 
+            to_id.startswith("^") or
+            to_id == "4294967295" or
             raw_to_id == 4294967295 or
             to_id.lower() == "!ffffffff"
         )
@@ -486,30 +535,157 @@ class MeshInterface:
 
         if is_dm:
             my_str_id = str(self.my_id)
-            is_from_me = sender_id == my_str_id or sender_id.replace("!", "") == my_str_id.replace("!", "")
-            peer_id = sender_id if not is_from_me else to_id
-            dm_tab_name = f"▶{peer_id}"
-
+            is_from_me = (sender_id_raw == my_str_id or
+                          sender_id_raw.replace("!", "") == my_str_id.replace("!", ""))
+            peer_id = sender_id_raw if not is_from_me else to_id
+            dm_tab_name = f"▶{_normalize_node_id(str(peer_id))}"
             if self.app_dm_callback:
                 self.app_dm_callback(dm_tab_name)
-            self.store.add(dm_tab_name, sender_id, text, rssi=rssi, snr=snr, hops=hops_away)
+            self.store.add(dm_tab_name, sender_id_raw, text, rssi=rssi, snr=snr, hops=hops_away)
         else:
             ch_index = packet.get("channel", 0)
             channel = self.channel_names.get(ch_index, f"ch_{ch_index}")
             if self.app_channels_callback:
                 self.app_channels_callback(channel)
-            self.store.add(channel, sender_id, text, rssi=rssi, snr=snr, hops=hops_away)
+            self.store.add(channel, sender_id_raw, text, rssi=rssi, snr=snr, hops=hops_away)
 
         self.on_update()
         if hasattr(self, 'app') and self.app:
             self.app.call_from_thread(self.app._refresh_log)
             self.app.call_from_thread(self.app._refresh_nodes)
 
-    def _on_connect(self, interface, topic=pub.AUTO_TOPIC):
-        self.connected = True
-        self.store.add("system", "sys", "link established")
-        self._refresh_nodes()
+    def _handle_pong(self, packet, sender_norm: str, via_ack: bool = False, req_id=None):
+        rssi = packet.get("rxRssi")
+        snr  = packet.get("rxSnr")
+        hops_away = packet.get("hopsAway")
+        if hops_away is None:
+            hop_start = packet.get("hopStart")
+            hop_limit = packet.get("hopLimit")
+            if hop_start is not None and hop_limit is not None:
+                hops_away = hop_start - hop_limit
+
+        matched_session = None
+        matched_pid = None
+
+        if req_id and req_id in self._ping_sessions:
+            matched_pid = req_id
+            matched_session = self._ping_sessions.pop(req_id)
+        else:
+            for pid, sess in list(self._ping_sessions.items()):
+                sess_target, _, _ = sess
+                if _normalize_node_id(sess_target) == sender_norm:
+                    matched_pid = pid
+                    matched_session = self._ping_sessions.pop(pid)
+                    break
+
+        if matched_session:
+            _, send_time, ping_tab = matched_session
+            rtt_ms = (time.time() - send_time) * 1000
+            rtt_str = f"{rtt_ms:.0f}ms"
+        else:
+            ping_tab = f"▶{sender_norm or packet.get('fromId', '?')}"
+            rtt_str = "?"
+
+        if via_ack and matched_session:
+            sess_target = matched_session[0]
+            norm_target = _normalize_node_id(sess_target)
+            for nid, info in self.nodes.items():
+                if _normalize_node_id(str(nid)) == norm_target and isinstance(info, dict):
+                    if snr is None:
+                        snr = info.get("snr")
+                    if hops_away is None:
+                        hops_away = info.get("hopsAway")
+                    break
+
+        label = "PONG"
+        hop_part  = hop_indicator(hops_away) if hops_away is not None else ""
+        snr_part  = snr_bar(snr) if snr is not None else ""
+        rssi_part = f"rssi:{rssi}" if rssi is not None else ""
+
+        pong_line = f"{label}  rtt:{rtt_str}".strip()
+        self.store.add(ping_tab, "pong", pong_line, rssi=rssi, snr=snr, hops=hops_away)
+
+        if self.app_dm_callback:
+            self.app_dm_callback(ping_tab)
         self.on_update()
+        if hasattr(self, 'app') and self.app:
+            self.app.call_from_thread(self.app._refresh_log)
+            self.app.call_from_thread(self.app._refresh_nodes)
+
+    def _handle_traceroute(self, packet, sender_norm: str):
+        decoded = packet.get("decoded", {})
+        tr = decoded.get("traceroute", {})
+        route      = tr.get("route", [])
+        route_back = tr.get("routeBack", [])
+        snr_towards = tr.get("snrTowards", [])
+        snr_back    = tr.get("snrBack", [])
+
+        req_id = packet.get("requestId") or decoded.get("requestId")
+
+        matched_session = None
+        if req_id and req_id in self._traceroute_sessions:
+            matched_session = self._traceroute_sessions.pop(req_id)
+        else:
+            for pid, sess in list(self._traceroute_sessions.items()):
+                sess_target, _, _ = sess
+                if _normalize_node_id(sess_target) == sender_norm:
+                    matched_session = self._traceroute_sessions.pop(pid)
+                    break
+
+        if matched_session:
+            target_id, send_time, dm_tab = matched_session
+            rtt_ms = (time.time() - send_time) * 1000
+            rtt_str = f"{rtt_ms:.0f}ms"
+        else:
+            dm_tab = f"▶{sender_norm or packet.get('fromId', '?')}"
+            rtt_str = "?"
+            target_id = sender_norm
+
+        def node_name(num: int) -> str:
+            if num == 0xFFFFFFFF or num == 0:
+                return "???"
+            hex_id = f"!{num:08x}"
+            for nid, info in self.nodes.items():
+                if _normalize_node_id(str(nid)) == hex_id and isinstance(info, dict):
+                    ln = info.get("user", {}).get("longName") or info.get("user", {}).get("shortName")
+                    if ln:
+                        return ln
+            return hex_id[-8:]
+
+        my_name = self.my_name
+        dest_name = node_name(int(packet.get("from", 0)))
+
+        UNK_SNR = -128
+
+        def fmt_snr(val) -> str:
+            if val is None or val == UNK_SNR:
+                return ""
+            return f"({val}dB)"
+
+        forward_hops = [my_name]
+        for i, num in enumerate(route_back):
+            snr = snr_towards[i] if i < len(snr_towards) else None
+            forward_hops.append(f"{node_name(num)}{fmt_snr(snr)}")
+        snr_last = snr_towards[len(route_back)] if len(route_back) < len(snr_towards) else None
+        forward_hops.append(f"{dest_name}{fmt_snr(snr_last)}")
+
+        back_hops = [dest_name]
+        for i, num in enumerate(route):
+            snr = snr_back[i] if i < len(snr_back) else None
+            back_hops.append(f"{node_name(num)}{fmt_snr(snr)}")
+        snr_back_last = snr_back[len(route)] if len(route) < len(snr_back) else None
+        back_hops.append(f"{my_name}{fmt_snr(snr_back_last)}")
+
+        self.store.add(dm_tab, "tracert", f"traceroute  rtt:{rtt_str}")
+        self.store.add(dm_tab, "tracert", f"  → {' → '.join(forward_hops)}")
+        self.store.add(dm_tab, "tracert", f"  ← {' ← '.join(back_hops)}")
+
+        if self.app_dm_callback:
+            self.app_dm_callback(dm_tab)
+        self.on_update()
+        if hasattr(self, 'app') and self.app:
+            self.app.call_from_thread(self.app._refresh_log)
+            self.app.call_from_thread(self.app._refresh_nodes)
 
     def send(self, text: str, channel: int = 0) -> Optional[int]:
         if self.iface and self.connected:
@@ -538,6 +714,56 @@ class MeshInterface:
                 self.store.add("system", "sys", f"dm tx failed: {e}")
                 return None
         return None
+
+    def send_ping(self, target_id: str) -> Optional[int]:
+        if not self.iface or not self.connected:
+            return None
+        try:
+            from meshtastic import portnums_pb2
+            destination = target_id if target_id.startswith("!") else f"!{target_id}"
+            if destination.startswith("!") and len(destination) > 1:
+                try:
+                    destination = int(destination[1:], 16)
+                except ValueError:
+                    pass
+            result = self.iface.sendData(
+                b"ping",
+                destinationId=destination,
+                portNum=portnums_pb2.PortNum.REPLY_APP,
+                wantAck=True,
+                wantResponse=True,
+            )
+            pid = _extract_packet_id(result, store=self.store)
+            return pid
+        except Exception as e:
+            self.store.add("system", "sys", f"ping tx failed: {e}")
+            return None
+
+    def send_traceroute(self, target_id: str, hop_limit: int = 7) -> Optional[int]:
+        if not self.iface or not self.connected:
+            return None
+        try:
+            from meshtastic import portnums_pb2, mesh_pb2
+            destination = target_id if target_id.startswith("!") else f"!{target_id}"
+            if destination.startswith("!") and len(destination) > 1:
+                try:
+                    destination = int(destination[1:], 16)
+                except ValueError:
+                    pass
+            r = mesh_pb2.RouteDiscovery()
+            result = self.iface.sendData(
+                r,
+                destinationId=destination,
+                portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                wantAck=True,
+                wantResponse=True,
+                hopLimit=hop_limit,
+            )
+            pid = _extract_packet_id(result, store=self.store)
+            return pid
+        except Exception as e:
+            self.store.add("system", "sys", f"traceroute tx failed: {e}")
+            return None
 
 
 # ── INITIAL INITIALIZATION MODAL SCREEN ───────────────────────────────────────
@@ -677,7 +903,7 @@ class MeshApp(App):
     BINDINGS = [
         Binding("ctrl+c", "quit",         "quit",       show=True),
         Binding("ctrl+n", "next_channel", "next ch",    show=True),
-        Binding("ctrl+p", "prev_channel", "prev ch",    show=True),
+        Binding("ctrl+p", "main_menu",    "main menu",  show=True),
         Binding("ctrl+x", "close_channel","close DM",   show=True),
         Binding("ctrl+l", "clear_log",    "clear",      show=True),
         Binding("ctrl+d", "toggle_nodes", "nodes",      show=True),
@@ -696,8 +922,7 @@ class MeshApp(App):
         self.ch_index = 0
         self._nodes_visible = True
         self._update_pending = False
-        # Загружаем избранные ноды из БД
-        self._favorites: dict[str, str] = db.get_favorites()  # {node_id: label}
+        self._favorites: dict[str, str] = db.get_favorites()
 
     @property
     def current_channel(self) -> str:
@@ -796,12 +1021,13 @@ class MeshApp(App):
 
             try:
                 time.sleep(0.5) 
-                self.mesh.connect_tcp(host, port)
-                self.store.add("system", "sys", "[green]✓ Connected to Meshtastic via TCP![/green]")
+                if self.mesh.connect_tcp(host, port):
+                    self.store.add("system", "sys", "[green]✓ Connected to Meshtastic via TCP![/green]")
+                else:
+                    self.store.add("system", "sys", "[red]❌ Meshtastic connect failed[/red]")
+                    self.store.add("system", "sys", "[#38bdf8]Use :tcp <ip> to retry or check your node connection.[/#38bdf8]")
             except Exception as e:
                 self.store.add("system", "sys", f"[red]❌ Meshtastic init error: {e}[/red]")
-                self.store.add("system", "sys", "[#38bdf8]Use :tcp <ip> to retry or check your node connection.[/#38bdf8]")
-                
                 if hasattr(self.mesh, 'iface'):
                     self.mesh.iface = None
                 if "system" in self.channels:
@@ -903,17 +1129,14 @@ class MeshApp(App):
             log.write(Text(f"  — channel #{self.current_channel} is empty —", style=C["ghost"]))
             return
 
-       
         if force or lines_count <= 1:
             log.clear()
             for m in msgs:
                 self._write_msg(log, m)
             return
 
- 
         last_msg_changed = False
         if msgs and lines_count > 0:
-        
             if msgs[-1].get("is_own"):
                 last_msg_changed = True
 
@@ -922,7 +1145,6 @@ class MeshApp(App):
             for m in msgs:
                 self._write_msg(log, m)
         else:
- 
             delta = len(msgs) - lines_count
             if delta > 0:
                 for m in msgs[-delta:]:
@@ -993,7 +1215,6 @@ class MeshApp(App):
                 write_func("\n".join(lines))
                 return
 
-            self._displayed_node_ids = []
             output = Text.from_markup("\n".join(lines) + "\n")
 
             for nid, info in sorted(nodes_dict.items(), key=lambda x: (x[1].get("user", {}).get("longName") or x[1].get("user", {}).get("shortName") or "").lower() if isinstance(x[1], dict) else ""):
@@ -1006,17 +1227,8 @@ class MeshApp(App):
                     line.append(name, style="bold #e2e8f0")
                     line.append(f" ({snr}dB)\n", style="#808080")
                     output.append_text(line)
-                    self._displayed_node_ids.append(str(nid))
 
             write_func(output)
-
-            def handle_widget_click(event):
-                line_index = event.style.y - 1
-                if hasattr(self, '_displayed_node_ids') and 0 <= line_index < len(self._displayed_node_ids):
-                    target_node_id = self._displayed_node_ids[line_index]
-                    self._register_dm_tab(f"▶{target_node_id}")
-
-            nodes_widget.on_click = handle_widget_click
 
         except Exception as final_err:
             self.store.add("system", "debug", f"Render error: {final_err}")
@@ -1094,7 +1306,6 @@ class MeshApp(App):
         self._refresh_channel_bar()
 
     def _run_node_clean(self, days: int):
-        """Ручная очистка нод из памяти устройства по команде."""
         if not self.mesh.iface or not hasattr(self.mesh.iface, "nodes"):
             self.store.add("system", "sys", "Ошибка: устройство не подключено.")
             return
@@ -1114,7 +1325,6 @@ class MeshApp(App):
         for node_id in node_ids:
             if str(node_id) == str(self.mesh.my_id):
                 continue
-            # Не трогаем избранные ноды
             if str(node_id) in self._favorites:
                 continue
 
@@ -1126,10 +1336,8 @@ class MeshApp(App):
             if last_heard <= 0 or (current_time - last_heard) <= max_age_seconds:
                 continue
 
-           
             node_num = node_data.get("num")
             if node_num is None:
-                
                 try:
                     str_id = str(node_id)
                     node_num = int(str_id.lstrip("!"), 16)
@@ -1149,7 +1357,6 @@ class MeshApp(App):
                 self.store.add("system", "sys", f"  ✗ ошибка удаления {node_id}: {e}")
                 failed_count += 1
 
-       
         self.mesh._refresh_nodes()
         self._refresh_nodes()
 
@@ -1233,7 +1440,13 @@ class MeshApp(App):
 
         elif verb == "tcp" and args:
             host = args[0]
-            port = int(args[1]) if len(args) > 1 else 4403
+            try:
+                port = int(args[1]) if len(args) > 1 else 4403
+            except ValueError:
+                self.store.add("system", "sys", "Ошибка: неверный порт.")
+                self._refresh_log()
+                return
+
             self.store.add("system", "sys", f"connecting tcp {host}:{port}…")
             ok = self.mesh.connect_tcp(host, port)
             if ok:
@@ -1259,14 +1472,17 @@ class MeshApp(App):
         elif verb == "nodes":
             self.store.add("system", "sys", "=== node table ===")
             self._node_index_map = {}
-            idx = 1
             now = time.time()
 
-            for nid, info in self.mesh.nodes.items():
-                str_nid = str(nid)
-                if not isinstance(info, dict):
-                    continue
+            sorted_nodes = sorted(
+                [(nid, info) for nid, info in self.mesh.nodes.items() if isinstance(info, dict)],
+                key=lambda x: x[1].get("lastHeard", 0)
+            )
 
+            total = len(sorted_nodes)
+            for idx_offset, (nid, info) in enumerate(sorted_nodes):
+                idx = total - idx_offset
+                str_nid = str(nid)
                 u = info.get("user", info)
                 name = u.get("longName", str_nid[-6:])
                 hw_model = u.get("hwModel", "?")
@@ -1275,7 +1491,6 @@ class MeshApp(App):
                 snr_val = info.get("snr", "?")
                 hops = info.get("hopsAway", "?")
 
-           
                 pos = info.get("position", {})
                 lat = pos.get("latitude") or pos.get("latitudeI")
                 lon = pos.get("longitude") or pos.get("longitudeI")
@@ -1287,7 +1502,6 @@ class MeshApp(App):
                 else:
                     pos_str = "no gps"
 
-             
                 last_heard = info.get("lastHeard", 0)
                 if last_heard and last_heard > 0:
                     age_sec = int(now - last_heard)
@@ -1310,7 +1524,6 @@ class MeshApp(App):
                     f"  hw:{hw_model}  role:{role}"
                     f"  pos:{pos_str}  heard:{heard_str}"
                 )
-                idx += 1
 
             self.ch_index = self.channels.index("system")
             self.query_one("#log", RichLog).clear()
@@ -1321,11 +1534,9 @@ class MeshApp(App):
             resolved_id = None
             label = "?"
 
-           
             if hasattr(self, "_node_index_map") and target in self._node_index_map:
                 resolved_id = self._node_index_map[target]
 
-  
             if not resolved_id:
                 for nid, info in self.mesh.nodes.items():
                     str_nid = str(nid)
@@ -1333,7 +1544,6 @@ class MeshApp(App):
                         resolved_id = str_nid
                         break
 
-       
             if not resolved_id:
                 for nid, info in self.mesh.nodes.items():
                     if isinstance(info, dict):
@@ -1347,7 +1557,6 @@ class MeshApp(App):
                 self._refresh_log()
                 return
 
-  
             node_info = self.mesh.nodes.get(resolved_id, {})
             if isinstance(node_info, dict):
                 label = node_info.get("user", {}).get("longName", resolved_id)
@@ -1385,6 +1594,102 @@ class MeshApp(App):
             self.query_one("#log", RichLog).clear()
             self._refresh_log()
 
+        elif verb == "ping" and args:
+            target = " ".join(args).strip() if isinstance(args, list) else str(args).strip()
+            if not target:
+                self.store.add("system", "sys", "Usage: :ping <name/node_id/index>")
+                self._refresh_log()
+                return
+
+            resolved_id = None
+
+            if hasattr(self, '_node_index_map') and target in self._node_index_map:
+                resolved_id = _normalize_node_id(self._node_index_map[target])
+
+            if not resolved_id:
+                for nid, info in self.mesh.nodes.items():
+                    if isinstance(info, dict):
+                        ln = info.get("user", {}).get("longName", "")
+                        sn = info.get("user", {}).get("shortName", "")
+                        if ln.lower() == target.lower() or sn.lower() == target.lower():
+                            resolved_id = _normalize_node_id(str(nid))
+                            break
+
+            if not resolved_id:
+                resolved_id = _normalize_node_id(target) if target else target
+
+            dm_tab = f"▶{resolved_id}"
+            self._register_dm_tab(dm_tab)
+            self.ch_index = self.channels.index(dm_tab)
+            self.query_one("#log", RichLog).clear()
+            self._refresh_log()
+
+            display_name = resolved_id
+            for nid, info in self.mesh.nodes.items():
+                if _normalize_node_id(str(nid)) == resolved_id and isinstance(info, dict):
+                    display_name = info.get("user", {}).get("longName", resolved_id)
+                    break
+
+            self.store.add(dm_tab, "ping", f"PING → {display_name}  waiting…")
+            self._refresh_log()
+
+            pid = self.mesh.send_ping(resolved_id)
+            if pid is not None:
+                self.mesh._ping_sessions[pid] = (resolved_id, time.time(), dm_tab)
+                self.store.add(dm_tab, "ping", f"sent  packet_id={pid}")
+            else:
+                self.store.add(dm_tab, "ping", "✗ ping send failed (not connected?)")
+            self._refresh_log()
+
+        # ── TRACEROUTE COMMAND ──
+        elif verb in ("tracert", "traceroute") and args:
+            target = " ".join(args).strip() if isinstance(args, list) else str(args).strip()
+            if not target:
+                self.store.add("system", "sys", "Usage: :tracert <name/node_id/index>")
+                self._refresh_log()
+                return
+
+            resolved_id = None
+
+            if hasattr(self, '_node_index_map') and target in self._node_index_map:
+                resolved_id = _normalize_node_id(self._node_index_map[target])
+
+            if not resolved_id:
+                for nid, info in self.mesh.nodes.items():
+                    if isinstance(info, dict):
+                        ln = info.get("user", {}).get("longName", "")
+                        sn = info.get("user", {}).get("shortName", "")
+                        if ln.lower() == target.lower() or sn.lower() == target.lower():
+                            resolved_id = _normalize_node_id(str(nid))
+                            break
+
+            if not resolved_id:
+                resolved_id = _normalize_node_id(target) if target else target
+
+            dm_tab = f"▶{resolved_id}"
+            self._register_dm_tab(dm_tab)
+            self.ch_index = self.channels.index(dm_tab)
+            self.query_one("#log", RichLog).clear()
+            self._refresh_log()
+
+            display_name = resolved_id
+            for nid, info in self.mesh.nodes.items():
+                if _normalize_node_id(str(nid)) == resolved_id and isinstance(info, dict):
+                    display_name = info.get("user", {}).get("longName", resolved_id)
+                    break
+
+            self.store.add(dm_tab, "tracert", f"TRACEROUTE → {display_name}  waiting…")
+            self._refresh_log()
+
+            pid = self.mesh.send_traceroute(resolved_id)
+            if pid is not None:
+                self.mesh._traceroute_sessions[pid] = (resolved_id, time.time(), dm_tab)
+                self.store.add(dm_tab, "tracert", f"sent  packet_id={pid}")
+            else:
+                self.store.add(dm_tab, "tracert", "✗ traceroute send failed (not connected?)")
+            self._refresh_log()
+
+        # ── DM COMMAND ──
         elif verb == "dm" and args:
             target = " ".join(args).strip() if isinstance(args, list) else str(args).strip()
             if not target:
@@ -1394,18 +1699,19 @@ class MeshApp(App):
 
             resolved_id = None
             if hasattr(self, '_node_index_map') and target in self._node_index_map:
-                resolved_id = self._node_index_map[target]
-                self.store.add("system", "sys", f"[sys] Switching to node {target} (ID: {resolved_id})")
+                resolved_id = _normalize_node_id(self._node_index_map[target])
 
             if not resolved_id:
                 for nid, info in self.mesh.nodes.items():
                     if isinstance(info, dict):
                         current_long_name = info.get("user", {}).get("longName", "")
-                        if current_long_name.lower() == target.lower():
-                            resolved_id = str(nid)
+                        current_short_name = info.get("user", {}).get("shortName", "")
+                        if current_long_name.lower() == target.lower() or current_short_name.lower() == target.lower():
+                            resolved_id = _normalize_node_id(str(nid))
                             break
 
-            if not resolved_id: resolved_id = target
+            if not resolved_id: 
+                resolved_id = _normalize_node_id(target) if target else target
 
             dm_tab = f"▶{resolved_id}"
             self._register_dm_tab(dm_tab)
@@ -1435,6 +1741,8 @@ class MeshApp(App):
         self.ch_index = self.channels.index("system")
         cmds = [
             (":dm <name/id> ",   "create direct chat with node"),
+            (":tracert <name/id>", "start traceroute to node"),
+            (":ping <name/id/idx>", "ping node via REPLY_APP (no chat message)"),
             (":close / :x",      "close current private DM tab"),
             (":nodeclean <days>","clean old nodes manually (e.g. :nodeclean 7)"),
             (":serial /dev/ttyUSB0",  "connect and save default Serial target"),
@@ -1448,7 +1756,7 @@ class MeshApp(App):
             (":favs",                 "show favorite nodes"),
             (":q",               "quit"),
             ("ctrl+n",           "next channel"),
-            ("ctrl+p",           "main menu"),
+            ("ctrl+p",           "main menu (system tab)"),
             ("ctrl+x",           "close current DM tab"),
             ("ctrl+d",           "toggle node sidebar"),
             ("ctrl+l",           "clear log"),
@@ -1465,10 +1773,14 @@ class MeshApp(App):
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
 
-    def action_prev_channel(self):
-        self.ch_index = (self.ch_index - 1) % len(self.channels)
+    def action_main_menu(self):
+        if "system" in self.channels:
+            self.ch_index = self.channels.index("system")
+        else:
+            self.ch_index = 0
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
+        self._refresh_channel_bar()
 
     def action_close_channel(self):
         self._close_current_dm()
