@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from typing import Optional
-
+from textual.widget import Widget
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Input, RichLog, Static, Label, Button
 from textual.screen import ModalScreen
@@ -548,6 +548,19 @@ class MeshInterface:
             if self.app_channels_callback:
                 self.app_channels_callback(channel)
             self.store.add(channel, sender_id_raw, text, rssi=rssi, snr=snr, hops=hops_away)
+        
+
+            if channel == self.channel_names.get(ch_index) and ch_index == 0:  
+                self.on_update()
+                if hasattr(self, 'app') and self.app:
+                    self.app.call_from_thread(self.app._force_refresh_log)
+                
+            if channel == self.current_channel: 
+                self.on_update()
+                if hasattr(self, 'app') and self.app:
+                    self.app.call_from_thread(lambda: self.app._refresh_log(force=True))
+
+
 
         self.on_update()
         if hasattr(self, 'app') and self.app:
@@ -876,6 +889,203 @@ class NodePanel(ScrollableContainer):
         self.mount(Static(footer_text))
 
 
+import math
+
+class RadarWidget(Static):
+    
+    
+    DEFAULT_CSS = """
+    RadarWidget {
+        width: 1fr;
+        height: 1fr;
+        background: #0d1117;
+        padding: 0;
+        margin: 0;
+        border: none;
+        display: none;
+    }
+    """
+    
+    MYCITY_LAT = 57.0004
+    MYCITY_LON = 40.9739
+    
+    def __init__(self, mesh: MeshInterface, **kwargs):
+        super().__init__(**kwargs)
+        self.mesh = mesh
+        self.zoom = 2000.0
+        self.width_chars = 76
+        self.height_chars = 28
+        self.pan_x = 0.0  # смещение центра по долготе (в метрах)
+        self.pan_y = 0.0  # смещение центра по широте (в метрах)
+
+    def on_mount(self):
+        self.set_interval(2.0, self.update_radar)
+    
+    def on_resize(self, event) -> None:
+        if self.display:
+            self.update_radar()
+        
+    def action_zoom_in(self):
+        self.zoom = max(100, self.zoom / 1.5)
+        self.update_radar()
+        
+    def action_zoom_out(self):
+        self.zoom = min(100000, self.zoom * 1.5)
+        self.update_radar()
+
+    def action_pan_up(self):
+        self.pan_y += self.zoom * 0.3
+        self.update_radar()
+
+    def action_pan_down(self):
+        self.pan_y -= self.zoom * 0.3
+        self.update_radar()
+
+    def action_pan_left(self):
+        self.pan_x -= self.zoom * 0.3
+        self.update_radar()
+
+    def action_pan_right(self):
+        self.pan_x += self.zoom * 0.3
+        self.update_radar()
+
+    def action_pan_reset(self):
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.update_radar()
+        
+    def update_radar(self):
+        my_pos = self._get_center_position()
+        nodes_with_pos = []
+        
+        for nid, info in self.mesh.nodes.items():
+            if str(nid) == str(self.mesh.my_id):
+                continue
+            pos = self._extract_position(info)
+            if not pos:
+                continue
+            dist = self._haversine(my_pos[0], my_pos[1], pos[0], pos[1])
+            snr = None
+            name = ""
+            if isinstance(info, dict):
+                user = info.get("user", {})
+                name = (user.get("shortName") or user.get("longName", ""))[:5]
+            nodes_with_pos.append((nid, pos[0], pos[1], name))
+            
+        nodes_with_pos.sort(key=lambda x: x[3], reverse=True)
+        
+        size = self.size
+        w = max(size.width - 2, 20) if size.width > 10 else self.width_chars
+        h = max(size.height - 2, 10) if size.height > 6 else self.height_chars
+        
+        canvas = [[" " for _ in range(w)] for _ in range(h)]
+        cx, cy = w // 2, h // 2
+        
+        for x in range(0, w, 8):
+            for y in range(h):
+                canvas[y][x] = f"[{C['dim']}]·[/]"
+        for y in range(0, h, 5):
+            for x in range(w):
+                if canvas[y][x] == " ":
+                    canvas[y][x] = f"[{C['dim']}]·[/]"
+                    
+        canvas[cy][cx] = f"[bold {C['accent']}]◉[/]"
+        
+        placed_rects = [(cx - 1, cy - 1, cx + 2, cy + 2)]
+        cos_lat = math.cos(math.radians(my_pos[0]))
+        
+        for nid, lat, lon, name in nodes_with_pos:
+            d_lat = (lat - my_pos[0]) * 111_000 - self.pan_y
+            d_lon = (lon - my_pos[1]) * 111_000 * cos_lat - self.pan_x
+        
+            scale = min(w / 2, h / 2)
+            px = int(cx + (d_lon / self.zoom) * scale)
+            py = int(cy - (d_lat / self.zoom) * scale)
+            
+            if not (0 <= px < w and 0 <= py < h):
+                continue
+                
+            col = node_color(str(nid))
+            canvas[py][px] = f"[{col}]●[/]"
+            
+            snr_str = f"{snr:.0f}dB" if snr is not None else "?dB"
+            label =  f"{markup_escape(name)}"
+            
+            best_pos = None
+            offsets = [
+                (2, 0), (-len(label) - 1, 0),
+                (2, -1), (-len(label) - 1, -1),
+                (2, 1), (-len(label) - 1, 1),
+            ]
+            for dx, dy in offsets:
+                lx, ly = px + dx, py + dy
+                if 0 <= lx <= w - len(label) and 0 <= ly < h:
+                    rect = (lx, ly, lx + len(label), ly + 1)
+                    overlap = any(
+                        not (rect[2] < r[0] or rect[0] > r[2] or
+                             rect[3] < r[1] or rect[1] > r[3])
+                        for r in placed_rects
+                    )
+                    if not overlap:
+                        best_pos = (lx, ly)
+                        placed_rects.append(rect)
+                        break
+                        
+            if best_pos:
+                lx, ly = best_pos
+                for i, ch in enumerate(label):
+                    if 0 <= lx + i < w:
+                        canvas[ly][lx + i] = f"[dim {col}]{ch}[/]"
+                        
+        lines = ["".join(row) for row in canvas]
+        mode = "[NOGPS: IVANOVO]" if not self._has_real_gps() else "[GPS LIVE]"
+        pan_info = f" pan:{self.pan_x/1000:.1f}km,{self.pan_y/1000:.1f}km" if (self.pan_x or self.pan_y) else ""
+        header = f"[bold {C['accent2']}]⟁ RADAR[/] zoom:{self.zoom:.0f}m{pan_info} | [Ctrl+U/O] zoom | [Ctrl+↑↓←→] pan | {mode}"
+        footer = f"[{C['ghost']}]Nodes w/GPS: {len(nodes_with_pos)} | Center: YOU[/]"
+        
+        self.update(f"{header}\n" + "\n".join(lines) + f"\n{footer}")
+        
+    def _get_center_position(self):
+        real = self._get_my_real_position()
+        if real:
+            return real
+        return (self.MYCITY_LAT, self.MYCITY_LON)
+        
+    def _has_real_gps(self):
+        return self._get_my_real_position() is not None
+        
+    def _get_my_real_position(self):
+        if not self.mesh.iface:
+            return None
+        try:
+            my_num = self.mesh.iface.myInfo.myNodeNum
+            if hasattr(self.mesh.iface, 'nodes') and my_num in self.mesh.iface.nodes:
+                return self._extract_position(self.mesh.iface.nodes[my_num])
+        except Exception:
+            pass
+        return None
+        
+    def _extract_position(self, info):
+        if not isinstance(info, dict):
+            return None
+        pos = info.get("position", {})
+        lat = pos.get("latitude") if pos.get("latitude") is not None else pos.get("latitudeI")
+        lon = pos.get("longitude") if pos.get("longitude") is not None else pos.get("longitudeI")
+        if lat is not None and lon is not None:
+            if abs(lat) > 180:
+                lat, lon = lat * 1e-7, lon * 1e-7
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return (lat, lon)
+        return None
+        
+    def _haversine(self, lat1, lon1, lat2, lon2):
+        R = 6371000
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
 # ── MAIN APPLICATION ──────────────────────────────────────────────────────────
 
 class MeshApp(App):
@@ -898,6 +1108,7 @@ class MeshApp(App):
     Input:focus {{ border: none; }}
     #statusbar {{ height: 1; background: #161b22; color: {C['ghost']}; padding: 0 1; }}
     #channel-bar {{ height: 1; background: #161b22; padding: 0 1; }}
+    #radar-view {{ width: 1fr; height: 1fr; display: none; }}
     """
 
     BINDINGS = [
@@ -907,6 +1118,12 @@ class MeshApp(App):
         Binding("ctrl+x", "close_channel","close DM",   show=True),
         Binding("ctrl+l", "clear_log",    "clear",      show=True),
         Binding("ctrl+d", "toggle_nodes", "nodes",      show=True),
+        Binding("ctrl+u", "radar_zoom_in",  "map+", show=False),
+        Binding("ctrl+o", "radar_zoom_out", "map-", show=False),
+        Binding("ctrl+up",    "radar_pan_up",    "map↑", show=False),
+        Binding("ctrl+down",  "radar_pan_down",  "map↓", show=False),
+        Binding("ctrl+left",  "radar_pan_left",  "map←", show=False),
+        Binding("ctrl+right", "radar_pan_right", "map→", show=False),
         Binding("f1",     "show_help",    "help",       show=True),
     ]
 
@@ -918,7 +1135,7 @@ class MeshApp(App):
         self.mesh.app_channels_callback = self._register_channel_from_mesh
         self.mesh.app_dm_callback = self._register_dm_tab
 
-        self.channels = ["primary", "system", "debug"]
+        self.channels = ["primary", "system", "map", "debug"]
         self.ch_index = 0
         self._nodes_visible = True
         self._update_pending = False
@@ -958,8 +1175,9 @@ class MeshApp(App):
             with Vertical(id="chat-col"):
                 yield RichLog(id="log", wrap=True, highlight=False, markup=True)
                 with Horizontal(id="input-row"):
-                    yield Static(f"[{C['accent']}]mesh ›[/{C['accent']}] ", id="prompt", markup=True)
+                    yield Static(f"[{C['accent']}]mesh ›[/] ", id="prompt", markup=True)
                     yield Input(placeholder="type msg, :dm <name/id> or :help", id="msg-input")
+            yield RadarWidget(self.mesh, id="radar-view")   
             yield NodePanel(self.mesh, id="node-col")
         yield Static("", id="statusbar")
 
@@ -991,6 +1209,7 @@ class MeshApp(App):
         self.set_interval(0.5, self._refresh_status)
         self.set_interval(0.2, self._poll_updates)
         self.query_one("#msg-input", Input).focus()
+        self._update_chat_view()
 
     def handle_setup_result(self, result: dict):
         if not result:
@@ -1172,6 +1391,37 @@ class MeshApp(App):
                 badge += f"[{C['danger']}]{unread}[/{C['danger']}]"
             parts.append(badge)
         bar.update(" ".join(parts))
+
+        def _update_chat_view(self):
+            try:
+                log = self.query_one("#log", RichLog)
+                radar = self.query_one("#radar-view", RadarWidget)
+                input_row = self.query_one("#input-row")
+                if self.current_channel == "map":
+                    log.display = False
+                    input_row.display = False
+                    radar.display = True                   
+                    radar.refresh()
+                    radar.update_radar()
+                else:
+                    log.display = True
+                    input_row.display = True
+                    radar.display = False
+            except Exception:
+                pass
+
+
+    def action_radar_zoom_in(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_zoom_in()
+        except Exception:
+            pass
+
+    def action_radar_zoom_out(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_zoom_out()
+        except Exception:
+            pass
 
     def _refresh_nodes(self):
         try:
@@ -1768,10 +2018,61 @@ class MeshApp(App):
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
 
+    def _update_chat_view(self):
+        try:
+            chat_col = self.query_one("#chat-col")
+            radar = self.query_one("#radar-view", RadarWidget)
+            if self.current_channel == "map":
+                chat_col.display = False
+                radar.display = True
+                radar.update_radar()
+            else:
+                chat_col.display = True
+                radar.display = False
+        except Exception:
+            pass
+
+    def action_radar_zoom_in(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_zoom_in()
+        except Exception:
+            pass
+
+    def action_radar_zoom_out(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_zoom_out()
+        except Exception:
+            pass
+
+    def action_radar_pan_up(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_pan_up()
+        except Exception:
+            pass
+
+    def action_radar_pan_down(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_pan_down()
+        except Exception:
+            pass
+
+    def action_radar_pan_left(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_pan_left()
+        except Exception:
+            pass
+
+    def action_radar_pan_right(self):
+        try:
+            self.query_one("#radar-view", RadarWidget).action_pan_right()
+        except Exception:
+            pass
+
     def action_next_channel(self):
         self.ch_index = (self.ch_index + 1) % len(self.channels)
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
+        self._update_chat_view()
 
     def action_main_menu(self):
         if "system" in self.channels:
@@ -1780,6 +2081,7 @@ class MeshApp(App):
             self.ch_index = 0
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
+        self._update_chat_view() 
         self._refresh_channel_bar()
 
     def action_close_channel(self):
