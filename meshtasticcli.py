@@ -2,14 +2,14 @@
 """
 meshtastic TUI client — no internet, no servers, no gods
 """
-
+import random
 import asyncio
 import time
 import sys
 import os
 import pprint
 import sqlite3
-import json
+import jsonQ
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from typing import Optional
@@ -45,6 +45,60 @@ C = {
     "hi":      "#9f7aea",   # purple
     "bg":      "on #0d1117",
 }
+
+MANIFESTS = [   
+    "no internet · no servers · no gods",
+    "off-grid · off-cloud · off-leash",
+    "off-grid, on-air",
+    "decentralized by design",
+    "frequency is freedom",
+    "peer-to-peer, forever",
+    "signal through silence",
+    "nodes over networks",
+    "when in doubt · transmit",
+    "the cloud is someone else's computer · this is yours",
+    "radio waves don't need terms of service",
+    "no login required · no soul collected",
+    "no API keys · no rate limits · no quarterly earnings calls",
+    "packet radio never needed a venture capitalist",
+    "the mesh doesn't have a privacy policy · the mesh has physics",
+    "no data broker can hear you on 915MHz",
+    "packets travel by radio · not by grace of silicon valley",
+    "no subscription · no surveillance · no surrender",
+    "infrastructure is a liability · frequency is free",
+    "born in the noise floor · thriving in the static",
+    "no uptime SLA · just physics and willpower",
+    "SNR > politics", 
+    "LoRa carries farther than promises",
+    "500mW of transmit power · infinite jurisdictional ambiguity",
+    "every hop a handshake between equals",
+    "no BGP required · no peering agreements · just RF",
+    "spread spectrum · spread autonomy",
+    "your data ends at the antenna · not in a warehouse",
+    "when the towers fall · the mesh stands",
+    "mesh survives the apocalypse · you might too",
+    "mesh: the last network standing",
+    "every node a republic · every packet sovereign",
+    "the topology is flat · like the power structure should be",
+    "mesh topology: no head to cut off",
+    "where coverage ends · community begins",
+    "nodes don't ask for permission · neither should you",
+    "signal propagates · empires don't",    
+    "pinging the ether · no traceroute needed", 
+    "hardware, firmware, atmosphere", 
+    "terminal to terminal, antenna to antenna", 
+    "can't patch out the laws of physics", 
+    "free speech runs on 12.5 kHz bandwidth", 
+    "encrypted in transit · forgotten on arrival", 
+    "routing tables built by trust · not algorithms",
+    "packet injected · airwaves liberated",
+    "the grid is an illusion · the mesh is real",
+    "no central authority · just peer consensus and RF",
+    "airwaves belong to the code",
+    "unmonitored, unfiltered, unstoppable",
+    "unplugged from the net · plugged into the environment",
+    ]
+
 
 # ── НАСТРОЙКИ ВРЕМЕНИ (UTC+3 Москва автономно) ──────────────────────────────
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -1181,10 +1235,11 @@ class MeshApp(App):
             yield NodePanel(self.mesh, id="node-col")
         yield Static("", id="statusbar")
 
+    
     def _header_art(self) -> str:
         logo = f"[bold {C['hi']}]▰▰ meshtastic cli client[/bold {C['hi']}]"
         mode = f"[{C['accent']}]⟁ AUTONOMOUS MODE[/{C['accent']}]"
-        manifest = f"[{C['ghost']}]no internet · no servers · no gods[/{C['ghost']}]"
+        manifest = f"[{C['ghost']}]{random.choice(MANIFESTS)}[/{C['ghost']}]"
         return f" {logo} │ {mode} ── {manifest}"
 
     def on_mount(self):
