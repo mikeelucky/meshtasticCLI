@@ -1522,10 +1522,33 @@ class MeshApp(App):
 
             output = Text.from_markup("\n".join(lines) + "\n")
 
-            for nid, info in sorted(nodes_dict.items(), key=lambda x: (x[1].get("user", {}).get("longName") or x[1].get("user", {}).get("shortName") or "").lower() if isinstance(x[1], dict) else ""):
+            # Ключ сортировки: Сортируем по 'lastHeard' (по умолчанию 0, если нет данных).
+            # Самые свежие ноды будут иметь больший таймстамп.
+            def get_node_sort_key(item):
+                _, info_dict = item
+                if isinstance(info_dict, dict):
+                    return info_dict.get("lastHeard", 0) or 0
+                return 0
+
+            # Сортируем в порядке возрастания таймстампа (активные окажутся внизу списка)
+            sorted_nodes = sorted(nodes_dict.items(), key=get_node_sort_key)
+
+            for nid, info in sorted_nodes:
                 if isinstance(info, dict):
                     user_info = info.get("user", {})
-                    name = user_info.get("longName") or user_info.get("shortName") or f"!{nid:08x}"
+                    
+                    # Безопасное определение имени и Hex ID ноды
+                    if user_info.get("longName") or user_info.get("shortName"):
+                        name = user_info.get("longName") or user_info.get("shortName")
+                    else:
+                        # Защита от string/int несоответствия:
+                        if isinstance(nid, int):
+                            name = f"!{nid:08x}"
+                        else:
+                            # Если nid уже строка, проверяем, есть ли восклицательный знак в начале
+                            nid_str = str(nid)
+                            name = nid_str if nid_str.startswith("!") else f"!{nid_str}"
+
                     snr = info.get("snr", 0.0)
                     line = Text()
                     line.append(" ", style="bold #e2e8f0")
