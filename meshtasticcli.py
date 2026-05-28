@@ -1296,12 +1296,12 @@ class MeshApp(App):
             try:
                 time.sleep(0.5) 
                 if self.mesh.connect_tcp(host, port):
-                    self.store.add("system", "sys", "[green]✓ Connected to Meshtastic via TCP![/green]")
+                    self.store.add("system", "sys", "✓ Connected to Meshtastic via TCP!")
                 else:
-                    self.store.add("system", "sys", "[red]❌ Meshtastic connect failed[/red]")
-                    self.store.add("system", "sys", "[#38bdf8]Use :tcp <ip> to retry or check your node connection.[/#38bdf8]")
+                    self.store.add("system", "sys", "❌ Meshtastic connect failed")
+                    self.store.add("system", "sys", "Use :tcp <ip> to retry or check your node connection.")
             except Exception as e:
-                self.store.add("system", "sys", f"[red]❌ Meshtastic init error: {e}[/red]")
+                self.store.add("system", "sys", f"❌ Meshtastic init error: {e}")
                 if hasattr(self.mesh, 'iface'):
                     self.mesh.iface = None
                 if "system" in self.channels:
@@ -1447,23 +1447,23 @@ class MeshApp(App):
             parts.append(badge)
         bar.update(" ".join(parts))
 
-        def _update_chat_view(self):
-            try:
-                log = self.query_one("#log", RichLog)
-                radar = self.query_one("#radar-view", RadarWidget)
-                input_row = self.query_one("#input-row")
-                if self.current_channel == "map":
-                    log.display = False
-                    input_row.display = False
-                    radar.display = True                   
-                    radar.refresh()
-                    radar.update_radar()
-                else:
-                    log.display = True
-                    input_row.display = True
-                    radar.display = False
-            except Exception:
-                pass
+    def _update_chat_view(self):
+        try:
+            log = self.query_one("#log", RichLog)
+            radar = self.query_one("#radar-view", RadarWidget)
+            input_row = self.query_one("#input-row")
+            if self.current_channel == "map":
+                log.display = False
+                input_row.display = False
+                radar.display = True                   
+                radar.refresh()
+                radar.update_radar()
+            else:
+                log.display = True
+                input_row.display = True
+                radar.display = False
+        except Exception:
+            pass
 
 
     def action_radar_zoom_in(self):
