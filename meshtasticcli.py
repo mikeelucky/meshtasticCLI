@@ -277,11 +277,26 @@ def hop_indicator(hops: int) -> str:
 # ── MESSAGE STORE WITH PERSISTENCE ────────────────────────────────────────────
 
 class MessageStore:
+    DEBUG_MAX_AGE_SECONDS = 3600  # хранить debug-сообщения не дольше 1 часа
+
     def __init__(self):
         self.channels: dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
         self.unread: dict[str, int] = defaultdict(int)
         self.pending_acks: dict[int, dict] = {}
         self._late_acks: dict[int, tuple] = {}
+
+    def _trim_debug(self):
+        """Удаляем debug-сообщения старше DEBUG_MAX_AGE_SECONDS."""
+        dq = self.channels.get("debug")
+        if not dq:
+            return
+        cutoff = datetime.now(MOSCOW_TZ).strftime("%H:%M:%S")
+        cutoff_time = time.time() - self.DEBUG_MAX_AGE_SECONDS
+        # Сообщения хранят только строку ts (HH:MM:SS), а не timestamp.
+        # Проще всего просто обрезать по размеру — но мы хотим по времени.
+        # Добавим к каждому debug-сообщению _epoch при создании и фильтруем по нему.
+        while dq and dq[0].get("_epoch", 0) < cutoff_time:
+            dq.popleft()
 
     def load_history(self, channel: str):
         """Loads historical messages from SQLite if current queue is empty."""
@@ -321,6 +336,7 @@ class MessageStore:
 
         entry = {
             "ts": ts(),
+            "_epoch": time.time(),
             "sender": str(sender),
             "text": text,
             "is_own": is_own,
@@ -332,6 +348,8 @@ class MessageStore:
             "ack_detail": "",
         }
         self.channels[channel].append(entry)
+        if channel == "debug":
+            self._trim_debug()
         if not is_own:
             self.unread[channel] += 1
         if is_own and packet_id is not None:
@@ -439,6 +457,8 @@ class MeshInterface:
         self.app_dm_callback = None
         self._ping_sessions: dict[int, tuple] = {}
         self._traceroute_sessions: dict[int, tuple] = {}
+        self._last_conn_type: Optional[str] = None
+        self._last_conn_target = None
 
     def _refresh_nodes(self) -> None:
         if self.iface and hasattr(self.iface, "nodes") and self.iface.nodes:
@@ -449,6 +469,8 @@ class MeshInterface:
 
     def connect_serial(self, port: str) -> bool:
         try:
+            self._last_conn_type = "serial"
+            self._last_conn_target = port
             self.iface = meshtastic.serial_interface.SerialInterface(port)
             self._setup_real()
             return True
@@ -458,8 +480,11 @@ class MeshInterface:
 
     def connect_tcp(self, host: str, port: int = 4403) -> bool:
         try:
+            self._last_conn_type = "tcp"
+            self._last_conn_target = (host, port)
             self.iface = meshtastic.tcp_interface.TCPInterface(host, portNumber=port)
             self._setup_real()
+            pub.subscribe(self._on_lost, "meshtastic.connection.lost")
             return True
         except Exception as e:
             self.store.add("system", "sys", f"tcp connect failed: {e}")
@@ -504,6 +529,15 @@ class MeshInterface:
         if hasattr(self, 'on_update') and self.on_update:
             self.on_update()
 
+    def _on_lost(self, interface, topic=pub.AUTO_TOPIC):
+        if not self.connected:
+            return
+        self.connected = False
+        self.store.add("system", "sys", "[red]⚠ connection lost — reconnecting...[/red]")
+        self.on_update()
+        if getattr(self, "app", None):
+            self.app.call_from_thread(self.app._start_reconnect_loop)
+
     def _on_connect(self, interface, topic=pub.AUTO_TOPIC):
         self.connected = True
         self.store.add("system", "sys", "link established")
@@ -512,6 +546,13 @@ class MeshInterface:
 
     def _on_recv(self, packet, interface):
         self._refresh_nodes()
+        sender_id_raw = str(packet.get("fromId", ""))
+        sender_norm = _normalize_node_id(sender_id_raw) if sender_id_raw else ""
+
+        if hasattr(self, "app") and self.app:
+            my_id_norm = _normalize_node_id(str(getattr(self, "my_id", "")))
+            if sender_norm and sender_norm != my_id_norm:
+                self.app.last_external_packet_time = datetime.now(MOSCOW_TZ)
 
         decoded = packet.get("decoded", {})
         text = decoded.get("text", "")
@@ -602,23 +643,10 @@ class MeshInterface:
             if self.app_channels_callback:
                 self.app_channels_callback(channel)
             self.store.add(channel, sender_id_raw, text, rssi=rssi, snr=snr, hops=hops_away)
-        
-
-            if channel == self.channel_names.get(ch_index) and ch_index == 0:  
-                self.on_update()
-                if hasattr(self, 'app') and self.app:
-                    self.app.call_from_thread(self.app._force_refresh_log)
-                
-            if channel == self.current_channel: 
-                self.on_update()
-                if hasattr(self, 'app') and self.app:
-                    self.app.call_from_thread(lambda: self.app._refresh_log(force=True))
-
-
 
         self.on_update()
         if hasattr(self, 'app') and self.app:
-            self.app.call_from_thread(self.app._refresh_log)
+            self.app.call_from_thread(self.app._force_refresh_log)
             self.app.call_from_thread(self.app._refresh_nodes)
 
     def _handle_pong(self, packet, sender_norm: str, via_ack: bool = False, req_id=None):
@@ -676,7 +704,7 @@ class MeshInterface:
             self.app_dm_callback(ping_tab)
         self.on_update()
         if hasattr(self, 'app') and self.app:
-            self.app.call_from_thread(self.app._refresh_log)
+            self.app.call_from_thread(self.app._force_refresh_log)
             self.app.call_from_thread(self.app._refresh_nodes)
 
     def _handle_traceroute(self, packet, sender_norm: str):
@@ -751,7 +779,7 @@ class MeshInterface:
             self.app_dm_callback(dm_tab)
         self.on_update()
         if hasattr(self, 'app') and self.app:
-            self.app.call_from_thread(self.app._refresh_log)
+            self.app.call_from_thread(self.app._force_refresh_log)
             self.app.call_from_thread(self.app._refresh_nodes)
 
     def send(self, text: str, channel: int = 0) -> Optional[int]:
@@ -1184,20 +1212,59 @@ class MeshApp(App):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.store = MessageStore()
+        self.last_external_packet_time = None
         self.mesh = MeshInterface(self.store, self._schedule_update)
         self.mesh.app = self
         self.mesh.app_channels_callback = self._register_channel_from_mesh
         self.mesh.app_dm_callback = self._register_dm_tab
-
+        self._reconnect_timer = None
         self.channels = ["primary", "system", "map", "debug"]
         self.ch_index = 0
         self._nodes_visible = True
         self._update_pending = False
         self._favorites: dict[str, str] = db.get_favorites()
+        self._rendered_count: dict[str, int] = {}  # channel -> кол-во отрисованных сообщений
 
     @property
     def current_channel(self) -> str:
         return self.channels[self.ch_index]
+
+    def _start_reconnect_loop(self):
+        if self._reconnect_timer:
+            return
+        self._reconnect_timer = self.set_interval(10.0, self._try_reconnect)
+        self._refresh_log()
+
+    def _try_reconnect(self):
+        if self.mesh.connected:
+            if self._reconnect_timer:
+                self._reconnect_timer.stop()
+                self._reconnect_timer = None
+            return
+
+        self.store.add("system", "sys", "↻ reconnect attempt...")
+        self._refresh_log()
+
+        try:
+            if self.mesh.iface:
+                try: self.mesh.iface.close()
+                except Exception: pass
+
+            ok = False
+            if self.mesh._last_conn_type == "tcp":
+                host, port = self.mesh._last_conn_target
+                ok = self.mesh.connect_tcp(host, port)
+            elif self.mesh._last_conn_type == "serial":
+                ok = self.mesh.connect_serial(self.mesh._last_conn_target)
+
+            if ok:
+                self.store.add("system", "sys", "[green]✓ reconnected[/green]")
+                self._reconnect_timer.stop()
+                self._reconnect_timer = None
+        except Exception as e:
+            self.store.add("system", "sys", f"reconnect failed: {e}")
+
+        self._refresh_log()
 
     def _register_channel_from_mesh(self, name: str):
         if name not in self.channels:
@@ -1243,15 +1310,18 @@ class MeshApp(App):
         return f" {logo} │ {mode} ── {manifest}"
 
     def on_mount(self):
-        self._refresh_channel_bar()
-        self._refresh_log()
-        self._refresh_status()
-        self._refresh_nodes()
-
+        # Сначала загружаем историю в store — до любой отрисовки
         for ch in self.channels:
             if ch not in ("system", "debug"):
                 self.store.load_history(ch)
-        self._refresh_log()
+
+        self._refresh_channel_bar()
+        self._refresh_status()
+        self._refresh_nodes()
+
+        # Откладываем первую отрисовку лога до следующего тика Textual,
+        # когда все виджеты гарантированно смонтированы и размеры известны
+        self.call_after_refresh(self._initial_render)
 
         conn_type = db.get_setting("conn_type")
         conn_target = db.get_setting("conn_target")
@@ -1272,6 +1342,11 @@ class MeshApp(App):
         db.set_setting("conn_type", result["type"])
         db.set_setting("conn_target", result["target"])
         self._connect_to_mesh(result["type"], result["target"])
+
+    def _initial_render(self):
+        """Вызывается после первого refresh Textual — виджеты точно готовы."""
+        self._rendered_count.clear()
+        self._refresh_log(force=True)
 
     def _connect_to_mesh(self, conn_type: str, conn_target: str):
         if conn_type == "serial":
@@ -1381,48 +1456,52 @@ class MeshApp(App):
 
     def _force_refresh_log(self):
         try:
+            ch = self.current_channel
             log = self.query_one("#log", RichLog)
             log.clear()
-            for m in self.store.get(self.current_channel):
+            msgs = self.store.get(ch)
+            for m in msgs:
                 self._write_msg(log, m)
-            self.store.mark_read(self.current_channel)
+            self._rendered_count[ch] = len(msgs)
+            self.store.mark_read(ch)
             self._refresh_channel_bar()
         except Exception:
             pass
 
     def _refresh_log(self, force: bool = False):
         log = self.query_one("#log", RichLog)
-        msgs = self.store.get(self.current_channel)
-        self.store.mark_read(self.current_channel)
+        ch = self.current_channel
+        msgs = self.store.get(ch)
+        self.store.mark_read(ch)
         self._refresh_channel_bar()
-
-        lines_count = len(log.lines)
 
         if not msgs:
             log.clear()
-            log.write(Text(f"  — channel #{self.current_channel} is empty —", style=C["ghost"]))
+            self._rendered_count[ch] = 0
+            log.write(Text(f"  — channel #{ch} is empty —", style=C["ghost"]))
             return
 
-        if force or lines_count <= 1:
+        rendered = self._rendered_count.get(ch, 0)
+
+        # Полная перерисовка нужна если: явный force, первый раз, или последнее
+        # своё сообщение изменило статус (ACK пришёл)
+        last_own_changed = (
+            msgs[-1].get("is_own") and rendered > 0
+        )
+
+        if force or rendered == 0 or last_own_changed:
             log.clear()
             for m in msgs:
                 self._write_msg(log, m)
+            self._rendered_count[ch] = len(msgs)
             return
 
-        last_msg_changed = False
-        if msgs and lines_count > 0:
-            if msgs[-1].get("is_own"):
-                last_msg_changed = True
-
-        if last_msg_changed:
-            log.clear()
-            for m in msgs:
+        # Дописываем только новые сообщения
+        delta = len(msgs) - rendered
+        if delta > 0:
+            for m in msgs[-delta:]:
                 self._write_msg(log, m)
-        else:
-            delta = len(msgs) - lines_count
-            if delta > 0:
-                for m in msgs[-delta:]:
-                    self._write_msg(log, m)
+            self._rendered_count[ch] = len(msgs)
 	
     def _refresh_channel_bar(self):
         bar = self.query_one("#channel-bar", Static)
@@ -1522,16 +1601,19 @@ class MeshApp(App):
 
             output = Text.from_markup("\n".join(lines) + "\n")
 
-            # Ключ сортировки: Сортируем по 'lastHeard' (по умолчанию 0, если нет данных).
-            # Самые свежие ноды будут иметь больший таймстамп.
-            def get_node_sort_key(item):
-                _, info_dict = item
+            # Сортируем по имени ноды в алфавитном порядке (регистронезависимо)
+            def get_node_name_key(item):
+                nid, info_dict = item
                 if isinstance(info_dict, dict):
-                    return info_dict.get("lastHeard", 0) or 0
-                return 0
+                    user_info = info_dict.get("user", {})
+                    name = user_info.get("longName") or user_info.get("shortName", "")
+                    if name:
+                        return name.lower()
+                # fallback — hex id
+                nid_str = str(nid)
+                return (nid_str if nid_str.startswith("!") else f"!{nid_str}").lower()
 
-            # Сортируем в порядке возрастания таймстампа (активные окажутся внизу списка)
-            sorted_nodes = sorted(nodes_dict.items(), key=get_node_sort_key)
+            sorted_nodes = sorted(nodes_dict.items(), key=get_node_name_key)
 
             for nid, info in sorted_nodes:
                 if isinstance(info, dict):
@@ -1583,10 +1665,15 @@ class MeshApp(App):
             statusbar = self.query_one("#statusbar")
         except Exception:
             return
+        
 
+        now = datetime.now(MOSCOW_TZ)
         now = datetime.now(MOSCOW_TZ)
         time_str = now.strftime("%H:%M:%S")
         date_str = now.strftime("%d.%m.%y")
+
+        last_ext = getattr(self, "last_external_packet_time", None)
+        last_ext_str = last_ext.strftime("%d.%m.%y %H:%M:%S") if last_ext else "—"
 
         my_hex_id = "!local"
         long_name = "Operator"
@@ -1613,7 +1700,8 @@ class MeshApp(App):
         status_text = (
             f"[bold #38bdf8]MYID:[/bold #38bdf8] {my_hex_id}  "
             f"[bold #e2e8f0]MYNAME:[/bold #e2e8f0] {long_name}  |  "
-            f"[bold #ae7cff]{date_str} {time_str} (MSK)[/bold #ae7cff]"
+            f"[bold #ae7cff]{date_str} {time_str} (MSK)[/bold #ae7cff]  |  "
+            f"[bold #7cffae]LAST EXT PACKET:[/bold #7cffae] {last_ext_str}"
         )
 
         if hasattr(statusbar, "update"): statusbar.update(status_text)
@@ -2148,6 +2236,8 @@ class MeshApp(App):
 
     def action_next_channel(self):
         self.ch_index = (self.ch_index + 1) % len(self.channels)
+        ch = self.current_channel
+        self._rendered_count[ch] = 0
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
         self._update_chat_view()
@@ -2157,6 +2247,8 @@ class MeshApp(App):
             self.ch_index = self.channels.index("system")
         else:
             self.ch_index = 0
+        ch = self.current_channel
+        self._rendered_count[ch] = 0
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
         self._update_chat_view() 
