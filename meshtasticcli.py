@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 from typing import Optional
 from textual.widget import Widget
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Input, RichLog, Static, Label, Button
+from textual.widgets import Header, Footer, Input, RichLog, Static, Label, Button, OptionList
 from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.binding import Binding
@@ -26,6 +26,12 @@ try:
     import meshtastic
     import meshtastic.serial_interface
     import meshtastic.tcp_interface
+    # Importing BLE interface carefully since it's possible that we have no BLE adapter
+    try:
+        import meshtastic.ble_interface
+        BLE_AVAILABLE = True
+    except ImportError:
+        BLE_AVAILABLE = False
     from pubsub import pub
     MESH_AVAILABLE = True
 except ImportError:
@@ -273,6 +279,13 @@ def hop_indicator(hops: int) -> str:
     else:
         return f"[{C['ghost']}]· {hops}hop[/{C['ghost']}]"
 
+def scan_ble_devices():
+    if not BLE_AVAILABLE:
+        return []
+    try:
+        return meshtastic.ble_interface.BLEInterface.scan()
+    except Exception:
+        return []
 
 # ── MESSAGE STORE WITH PERSISTENCE ────────────────────────────────────────────
 
@@ -488,6 +501,34 @@ class MeshInterface:
             return True
         except Exception as e:
             self.store.add("system", "sys", f"tcp connect failed: {e}")
+            return False
+
+    def connect_ble(self, address=None) -> bool:
+        if not BLE_AVAILABLE:
+            self.store.add(
+                "system",
+                "sys",
+                "BLE support unavailable (install bleak)"
+            )
+            return False
+        try:
+            self.iface = meshtastic.ble_interface.BLEInterface(address=address)
+            self._setup_real()
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if "pair" in err or "auth" in err:
+                self.store.add(
+                    "system",
+                    "sys",
+                    "BLE pairing required. Pair device in OS settings first."
+                )
+
+            self.store.add(
+                "system",
+                "sys",
+                f"ble connect failed: {e}"
+            )
             return False
 
     def _setup_real(self):
@@ -860,6 +901,67 @@ class MeshInterface:
             self.store.add("system", "sys", f"traceroute tx failed: {e}")
             return None
 
+# -- BLE DEVICES SCREEN --------------------------------------------------------
+
+class BLEScanScreen(ModalScreen):
+    DEFAULT_CSS = f"""
+    BLEScanScreen {{
+        align: center middle;
+        background: rgba(0, 0, 0, 0.75);
+    }}
+
+    #ble-dialog {{
+        width: 70;
+        height: 22;
+        border: solid {C['accent2']};
+        background: #161b22;
+        padding: 1 2;
+    }}
+
+    #ble-title {{
+        text-align: center;
+        margin-bottom: 1;
+    }}
+
+    #ble-list {{
+        height: 1fr;
+        border: solid {C['border']};
+    }}
+    """
+
+    def __init__(self, devices):
+        super().__init__()
+        self.devices = devices
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ble-dialog"):
+
+            yield Label(
+                f"[bold {C['accent2']}]⟳ BLE DEVICE SCAN[/bold {C['accent2']}]",
+                id="ble-title",
+                markup=True
+            )
+
+            options = []
+
+            for dev in self.devices:
+                name = dev.get("name") or "Unknown"
+                addr = dev.get("address") or "?"
+                rssi = dev.get("rssi")
+
+                rssi_str = f"{rssi} dBm" if rssi is not None else "?"
+                label = f"{name:<24} {rssi_str:<10} {addr}"
+
+                options.append(label)
+
+            yield OptionList(*options, id="ble-list")
+
+    def on_option_list_option_selected(self, event):
+        idx = event.option_index
+        self.dismiss(self.devices[idx])
+
+    def key_escape(self):
+        self.dismiss(None)
 
 # ── INITIAL INITIALIZATION MODAL SCREEN ───────────────────────────────────────
 
@@ -892,6 +994,10 @@ class SetupScreen(ModalScreen):
     #btn-submit {{
         width: 1fr;
     }}
+    .ble-row {{
+        height: 3;
+        margin-top: 0;
+    }}
     """
     def __init__(self):
         super().__init__()
@@ -901,12 +1007,70 @@ class SetupScreen(ModalScreen):
         with Vertical(id="setup-dialog"):
             yield Label(f"[bold {C['accent']}]⟁ MCLI INITIALIZATION[/bold {C['accent']}]", classes="setup-title", markup=True)
             yield Label("Select Connection Interface Type:")
-            with Horizontal():
+            with Horizontal(classes="ble-row"):
                 yield Button("TCP Network", id="choice-tcp", classes="btn-choice", variant="primary")
                 yield Button("Serial/USB COM", id="choice-serial", classes="btn-choice")
+            if BLE_AVAILABLE:
+                with Horizontal():
+                    yield Button("Bluetooth LE", id="choice-ble", classes="btn-choice")
+                    yield Button("Scan BLE devices", id="scan-ble", classes="btn-choice")
             yield Label("\nConnection Target Destination:", id="target-label")
             yield Input(placeholder="192.168.1.9:4403", id="conn-target-input")
             yield Button("CONFIRM & SAVE SETTINGS", id="btn-submit", variant="success")
+
+    async def _scan_ble_worker(self):
+        input_widget = self.query_one("#conn-target-input", Input)
+
+        input_widget.value = ""
+        input_widget.placeholder = "Scanning BLE devices..."
+
+        try:
+            raw_devices = await asyncio.to_thread(scan_ble_devices)
+
+            if not raw_devices:
+                input_widget.placeholder = "No BLE devices found"
+                return
+
+            devices = []
+
+            for d in raw_devices:
+                name = getattr(d, "name", "") or ""
+                addr = getattr(d, "address", "") or ""
+                rssi = getattr(d, "rssi", None)
+                devices.append({"name": name, "address": addr, "rssi": rssi,})
+
+
+            devices.sort(
+                key=lambda x: x["rssi"] if x["rssi"] is not None else -999,
+                reverse=True
+            )
+            selected = await self.app.push_screen_wait(
+                BLEScanScreen(devices)
+            )
+
+            if not selected:
+                input_widget.placeholder = "BLE scan cancelled"
+                return
+
+            input_widget.value = selected["address"]
+
+            input_widget.placeholder = (
+                f'{selected["name"]} ({selected["rssi"]} dBm)'
+            )
+
+            self.selected_type = "ble"
+
+            self.query_one("#choice-tcp").variant = "default"
+            self.query_one("#choice-serial").variant = "default"
+
+            if BLE_AVAILABLE:
+                self.query_one("#choice-ble").variant = "success"
+
+
+
+        except Exception as e:
+            input_widget.placeholder = f"BLE scan failed: {e}"
+
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "choice-tcp":
@@ -919,10 +1083,26 @@ class SetupScreen(ModalScreen):
             self.query_one("#choice-tcp").variant = "default"
             self.query_one("#choice-serial").variant = "warning"
             self.query_one("#conn-target-input", Input).placeholder = "/dev/ttyUSB0"
+        elif event.button.id == "choice-ble":
+            self.selected_type = "ble"
+            self.query_one("#choice-tcp").variant = "default"
+            self.query_one("#choice-serial").variant = "default"
+            if BLE_AVAILABLE:
+                self.query_one("#choice-ble").variant = "success"
+            self.query_one("#conn-target-input", Input).placeholder = "auto or BLE MAC"
+        elif event.button.id == "scan-ble":
+            self.run_worker(self._scan_ble_worker(), exclusive=True)
         elif event.button.id == "btn-submit":
             val = self.query_one("#conn-target-input", Input).value.strip()
             if not val:
-                val = "192.168.1.9:4403" if self.selected_type == "tcp" else "/dev/ttyUSB0"
+                if self.selected_type == "tcp":
+                     val = "192.168.1.9:4403"
+
+                elif self.selected_type == "serial":
+                    val = "/dev/ttyUSB0"
+
+                elif self.selected_type == "ble":
+                    val = "auto"
             self.dismiss({"type": self.selected_type, "target": val})
 
 
@@ -1384,6 +1564,80 @@ class MeshApp(App):
 
             self.query_one("#log", RichLog).clear()
             self._refresh_log()
+            
+        elif conn_type == "ble":
+            address = None
+
+            if conn_target and conn_target.lower() not in ("auto", "default"):
+                address = conn_target
+
+            self.store.add(
+                "system",
+                "sys",
+                f"Auto-connecting via BLE{' to ' + address if address else ''}..."
+            )
+
+            self.store.add(
+                "system",
+                "sys",
+                "Waiting for OS BLE pairing dialog if required..."
+            )
+
+            self._refresh_log()
+
+            try:
+                time.sleep(0.5)
+
+                if self.mesh.connect_ble(address):
+                    self.store.add(
+                        "system",
+                        "sys",
+                        "[green]✓ Connected to Meshtastic via BLE![/green]"
+                    )
+
+                else:
+                    self.store.add(
+                        "system",
+                        "sys",
+                        "[red]❌ BLE connection failed[/red]"
+                    )
+
+                    self.store.add(
+                        "system",
+                        "sys",
+                        "[#38bdf8]Try pairing the device in OS settings first.[/#38bdf8]"
+                    )
+
+            except Exception as e:
+                err = str(e).lower()
+
+                if (
+                    "pair" in err or
+                    "auth" in err or
+                    "denied" in err or
+                    "protocol" in err
+                ):
+                    self.store.add(
+                        "system",
+                        "sys",
+                        "[yellow]BLE pairing required. Pair device in OS settings first.[/yellow]"
+                    )
+
+                self.store.add(
+                    "system",
+                    "sys",
+                    f"[red]❌ BLE init error: {e}[/red]"
+                )
+
+                if hasattr(self.mesh, 'iface'):
+                    self.mesh.iface = None
+
+                if "system" in self.channels:
+                    self.ch_index = self.channels.index("system")
+
+            self.query_one("#log", RichLog).clear()
+            self._refresh_log()
+         
 
     def _poll_updates(self):
         if self._update_pending:
@@ -1873,6 +2127,22 @@ class MeshApp(App):
                 self.store.add("system", "sys", "tcp failed")
             self._refresh_log()
 
+        elif verb == "ble":
+            addr = args[0] if args else None
+
+            self.store.add(
+                "system",
+                "sys",
+                f"connecting BLE {addr or '[auto]'}..."
+            )
+            ok = self.mesh.connect_ble(addr)
+            self.store.add(
+                "system",
+                "sys",
+                "ble ok" if ok else "ble failed"
+            )
+            self._refresh_log()
+
         elif verb == "ch" and args:
             ch = args[0].lstrip("#").lower()
             if ch not in self.channels:
@@ -2177,6 +2447,17 @@ class MeshApp(App):
             ("ctrl+d",           "toggle node sidebar"),
             ("ctrl+l",           "clear log"),
         ]
+        # Adding BLE connect after TCP only if BLE is available
+        if BLE_AVAILABLE:
+            tcp_idx = next(
+                i for i, (cmd, _) in enumerate(cmds)
+                if cmd.startswith(":tcp")
+            )
+            cmds.insert(
+                 tcp_idx + 1,
+                 (":ble [mac]", "connect via BLE")
+            )
+
         self.store.add("system", "sys", "")
         self.store.add("system", "sys", "═══ commands ═══")
         for cmd, desc in cmds:
@@ -2271,6 +2552,11 @@ class MeshApp(App):
         self._show_help_in_log()
 
     def action_quit(self):
+        try:
+            for worker in self.workers:
+               worker.cancel()
+        except Exception: pass
+
         if self.mesh.iface:
             try: self.mesh.iface.close()
             except Exception: pass
@@ -2285,6 +2571,7 @@ def main():
     finally:
         print("\033[?25h", end="")
         print("\033[0m", end="")
+        os._exit(0)
 
 
 if __name__ == "__main__":
