@@ -3,23 +3,23 @@
 meshtastic TUI client — no internet, no servers, no gods
 """
 import random
-import asyncio
 import time
 import sys
-import os
 import pprint
 import sqlite3
-import jsonQ
+import math
+import threading
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from typing import Optional
-from textual.widget import Widget
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Input, RichLog, Static, Label, Button
+from textual.widgets import Input, RichLog, Static, Label, Button
 from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.binding import Binding
 from rich.text import Text
+from rich.table import Table
 from rich.markup import escape as markup_escape
 
 try:
@@ -27,26 +27,26 @@ try:
     import meshtastic.serial_interface
     import meshtastic.tcp_interface
     from pubsub import pub
-    MESH_AVAILABLE = True
 except ImportError:
     print("Error: meshtastic or pypubsub dependencies not installed.")
     sys.exit(1)
 
 
 C = {
-    "dim":     "#3d4451",
-    "border":  "#4a5568",
-    "accent":  "#68d391",   # green
-    "accent2": "#63b3ed",   # blue
-    "warn":    "#f6ad55",   # amber
-    "danger":  "#fc8181",   # red
-    "ghost":   "#718096",   # grey
-    "text":    "#e2e8f0",   # near-white
-    "hi":      "#9f7aea",   # purple
-    "bg":      "on #0d1117",
+    "dim":     "#1a1a2e",
+    "border":  "#ff2a6d",
+    "accent":  "#05d9e8",
+    "accent2": "#ff2a6d",
+    "warn":    "#f9f002",
+    "danger":  "#ff3860",
+    "ghost":   "#7d90b8",
+    "meta":    "#53e6d5",
+    "text":    "#d1f7ff",
+    "hi":      "#b537f2",
+    "bg":      "on #0a0a12",
 }
 
-MANIFESTS = [   
+MANIFESTS = [
     "no internet · no servers · no gods",
     "off-grid · off-cloud · off-leash",
     "off-grid, on-air",
@@ -68,7 +68,7 @@ MANIFESTS = [
     "infrastructure is a liability · frequency is free",
     "born in the noise floor · thriving in the static",
     "no uptime SLA · just physics and willpower",
-    "SNR > politics", 
+    "SNR > politics",
     "LoRa carries farther than promises",
     "500mW of transmit power · infinite jurisdictional ambiguity",
     "every hop a handshake between equals",
@@ -83,13 +83,13 @@ MANIFESTS = [
     "mesh topology: no head to cut off",
     "where coverage ends · community begins",
     "nodes don't ask for permission · neither should you",
-    "signal propagates · empires don't",    
-    "pinging the ether · no traceroute needed", 
-    "hardware, firmware, atmosphere", 
-    "terminal to terminal, antenna to antenna", 
-    "can't patch out the laws of physics", 
-    "free speech runs on 12.5 kHz bandwidth", 
-    "encrypted in transit · forgotten on arrival", 
+    "signal propagates · empires don't",
+    "pinging the ether · no traceroute needed",
+    "hardware, firmware, atmosphere",
+    "terminal to terminal, antenna to antenna",
+    "can't patch out the laws of physics",
+    "free speech runs on 12.5 kHz bandwidth",
+    "encrypted in transit · forgotten on arrival",
     "routing tables built by trust · not algorithms",
     "packet injected · airwaves liberated",
     "the grid is an illusion · the mesh is real",
@@ -107,27 +107,28 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 DB_PATH = "mcli.db"
 
 class Database:
+    PACKET_RETENTION = 2000  # храним не больше столько последних сырых пакетов
+
     def __init__(self):
+        self._lock = threading.RLock()
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
 
     def _init_db(self):
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
-         
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS favorites (
                     node_id TEXT PRIMARY KEY,
                     label   TEXT
                 )
             """)
-    
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +142,6 @@ class Database:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-      
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS packets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,62 +151,92 @@ class Database:
                 )
             """)
 
+        try:
+            with self._lock:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
+
     def add_favorite(self, node_id: str, label: str):
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 "INSERT OR REPLACE INTO favorites (node_id, label) VALUES (?, ?)",
                 (node_id, label)
             )
 
     def remove_favorite(self, node_id: str):
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("DELETE FROM favorites WHERE node_id = ?", (node_id,))
 
     def get_favorites(self) -> dict:
-        """Возвращает {node_id: label}"""
-        cur = self.conn.execute("SELECT node_id, label FROM favorites")
-        return {row["node_id"]: row["label"] for row in cur.fetchall()}
+
+        with self._lock:
+            cur = self.conn.execute("SELECT node_id, label FROM favorites")
+            return {row["node_id"]: row["label"] for row in cur.fetchall()}
 
     def get_setting(self, key: str) -> Optional[str]:
-        cur = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cur.fetchone()
-        return row["value"] if row else None
+        with self._lock:
+            cur = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else None
 
     def set_setting(self, key: str, value: str):
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", 
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (key, str(value))
             )
 
-    def save_message(self, channel: str, sender: str, text: str, is_own: bool, 
+    def save_message(self, channel: str, sender: str, text: str, is_own: bool,
                      rssi: Optional[float], snr: Optional[float], hops: Optional[int]):
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("""
                 INSERT INTO messages (channel, sender, text, is_own, rssi, snr, hops)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (channel, sender, text, 1 if is_own else 0, rssi, snr, hops))
 
     def get_history(self, channel: str, limit: int = 100) -> list:
-        cur = self.conn.execute("""
-            SELECT channel, sender, text, is_own, rssi, snr, hops, timestamp 
-            FROM messages 
-            WHERE channel = ? 
-            ORDER BY id DESC LIMIT ?
-        """, (channel, limit))
-        rows = cur.fetchall()
+        with self._lock:
+            cur = self.conn.execute("""
+                SELECT channel, sender, text, is_own, rssi, snr, hops, timestamp
+                FROM messages
+                WHERE channel = ?
+                ORDER BY id DESC LIMIT ?
+            """, (channel, limit))
+            rows = cur.fetchall()
         return list(reversed(rows))
 
     def save_packet(self, topic: str, payload: dict):
         try:
             serialized = json.dumps(payload, default=str)
-            with self.conn:
+            with self._lock, self.conn:
                 self.conn.execute(
                     "INSERT INTO packets (topic, payload) VALUES (?, ?)",
                     (topic, serialized)
                 )
+                self.conn.execute(
+                    "DELETE FROM packets WHERE id <= (SELECT MAX(id) FROM packets) - ?",
+                    (self.PACKET_RETENTION,)
+                )
         except Exception:
             pass
+
+    def checkpoint(self):
+
+        try:
+            with self._lock, self.conn:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+
+    def close(self):
+
+        self.checkpoint()
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
 db = Database()
 
@@ -221,13 +251,13 @@ def _normalize_node_id(raw: str) -> str:
     s = str(raw).strip()
     if s.startswith("!"):
         return s.lower()
-   
+
     try:
         n = int(s)
         return f"!{n:08x}"
     except ValueError:
         pass
- 
+
     try:
         int(s, 16)
         return f"!{s.lower()}"
@@ -237,33 +267,50 @@ def _normalize_node_id(raw: str) -> str:
 
 
 def ts() -> str:
-    """Return current time as HH:MM:SS in Europe/Moscow timezone."""
+
     return datetime.now(MOSCOW_TZ).strftime("%H:%M:%S")
 
 
+_EMOJI_MODIFIERS = {"\ufe0f", "\ufe0e", "\u200d", "\u20e3"}
+
+
+def _display_safe(text: str) -> str:
+
+    out = []
+    for ch in str(text):
+        if ch == "\n":
+            out.append(ch)
+        elif ch in _EMOJI_MODIFIERS:
+            continue
+        elif unicodedata.east_asian_width(ch) in ("W", "F"):
+            out.append("◌")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _age_str(last_heard) -> str:
+
+    if not last_heard or last_heard <= 0:
+        return "never"
+    age = time.time() - last_heard
+    if age < 60:
+        return f"{int(age)}s"
+    if age < 3600:
+        return f"{int(age // 60)}m"
+    if age < 86400:
+        return f"{int(age // 3600)}h"
+    return f"{int(age // 86400)}d"
+
+
 def node_color(node_id: str) -> str:
-    """Assign a deterministic color to a node ID."""
-    colors = [C["accent"], C["accent2"], C["hi"], C["warn"], "#f687b3", "#76e4f7"]
+
+    colors = [C["accent"], C["accent2"], C["hi"], C["warn"], "#ff71ce", "#01cdfe"]
     return colors[abs(hash(str(node_id))) % len(colors)]
 
 
-def snr_bar(snr: float) -> str:
-    """Render SNR as a bar with color-coded intensity."""
-    bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-    try:
-        level = max(0, min(7, int((float(snr) + 5) / 3)))
-    except (ValueError, TypeError):
-        return f"[{C['ghost']}]?[/{C['ghost']}]"
-
-    if snr >= 8:   col = C["accent"]
-    elif snr >= 3: col = C["warn"]
-    else:          col = C["danger"]
-
-    return f"[{col}]{bars[level] * (level + 1)}[/{col}]"
-
-
 def hop_indicator(hops: int) -> str:
-    """Render hop count with visual indicator."""
+
     if hops == 0:
         return f"[{C['accent']}]◉ direct[/{C['accent']}]"
     elif hops == 1:
@@ -280,31 +327,30 @@ class MessageStore:
     DEBUG_MAX_AGE_SECONDS = 3600  # хранить debug-сообщения не дольше 1 часа
 
     def __init__(self):
+        self._lock = threading.RLock()
         self.channels: dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
         self.unread: dict[str, int] = defaultdict(int)
         self.pending_acks: dict[int, dict] = {}
         self._late_acks: dict[int, tuple] = {}
 
     def _trim_debug(self):
-        """Удаляем debug-сообщения старше DEBUG_MAX_AGE_SECONDS."""
+
         dq = self.channels.get("debug")
         if not dq:
             return
-        cutoff = datetime.now(MOSCOW_TZ).strftime("%H:%M:%S")
         cutoff_time = time.time() - self.DEBUG_MAX_AGE_SECONDS
-        # Сообщения хранят только строку ts (HH:MM:SS), а не timestamp.
-        # Проще всего просто обрезать по размеру — но мы хотим по времени.
-        # Добавим к каждому debug-сообщению _epoch при создании и фильтруем по нему.
         while dq and dq[0].get("_epoch", 0) < cutoff_time:
             dq.popleft()
 
     def load_history(self, channel: str):
-        """Loads historical messages from SQLite if current queue is empty."""
-        if len(self.channels[channel]) == 0:
-            history = db.get_history(channel)
+
+        with self._lock:
+            if len(self.channels[channel]) != 0:
+                return
+        history = db.get_history(channel)
+        with self._lock:
             for row in history:
                 timestamp_str = row["timestamp"]
-                
                 try:
                     dt_utc = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                     dt_msc = dt_utc.astimezone(MOSCOW_TZ)
@@ -324,81 +370,94 @@ class MessageStore:
                     "snr": row["snr"],
                     "raw_debug": False,
                     "hops": row["hops"],
+                    "markup": False,
+                    "renderable": None,
                     "ack": "ack" if row["is_own"] else None,
                     "ack_detail": "",
                 })
 
     def add(self, channel: str, sender: str, text: str,
-            is_own=False, rssi=None, snr=None, hops=None, is_raw_debug=False, packet_id=None) -> dict:
-        
-        if channel not in ("system", "debug") and not is_raw_debug:
-            db.save_message(channel, sender, text, is_own, rssi, snr, hops)
+            is_own=False, rssi=None, snr=None, hops=None, is_raw_debug=False, packet_id=None, markup=False, renderable=None) -> dict:
+        with self._lock:
+            if channel not in ("system", "debug") and not is_raw_debug:
+                db.save_message(channel, sender, text, is_own, rssi, snr, hops)
 
-        entry = {
-            "ts": ts(),
-            "_epoch": time.time(),
-            "sender": str(sender),
-            "text": text,
-            "is_own": is_own,
-            "rssi": rssi,
-            "snr": snr,
-            "raw_debug": is_raw_debug,
-            "hops": hops,
-            "ack": None,
-            "ack_detail": "",
-        }
-        self.channels[channel].append(entry)
-        if channel == "debug":
-            self._trim_debug()
-        if not is_own:
-            self.unread[channel] += 1
-        if is_own and packet_id is not None:
-            self.pending_acks[int(packet_id)] = entry
-            self.add("debug", ">>>DBG<<<",
-                f"\n" + "="*50 +
-                f"\n  [PENDING_ACK REGISTERED] pid={int(packet_id)}"
-                f"\n  pending_keys={list(self.pending_acks.keys())}"
-                f"\n  late_acks={list(self._late_acks.keys())}"
-                f"\n" + "="*50, is_raw_debug=True)
-        return entry
+            entry = {
+                "ts": ts(),
+                "_epoch": time.time(),
+                "sender": str(sender),
+                "text": text,
+                "is_own": is_own,
+                "rssi": rssi,
+                "snr": snr,
+                "raw_debug": is_raw_debug,
+                "hops": hops,
+                "markup": markup,
+                "renderable": renderable,
+                "ack": None,
+                "ack_detail": "",
+            }
+            self.channels[channel].append(entry)
+            if channel == "debug":
+                self._trim_debug()
+            if not is_own and channel != "debug":
+                self.unread[channel] += 1
+            if is_own and packet_id is not None:
+                self.pending_acks[int(packet_id)] = entry
+                self.add("debug", ">>>DBG<<<",
+                    f"\n" + "="*50 +
+                    f"\n  [PENDING_ACK REGISTERED] pid={int(packet_id)}"
+                    f"\n  pending_keys={list(self.pending_acks.keys())}"
+                    f"\n  late_acks={list(self._late_acks.keys())}"
+                    f"\n" + "="*50, is_raw_debug=True)
+            return entry
 
     def set_ack(self, packet_id: int, status: str, detail: str = "") -> bool:
-        """Mark a sent message ack/nack/relay. Returns True if found."""
+
         pid = int(packet_id)
-        entry = self.pending_acks.get(pid)
-        if entry:
-            if entry["ack"] != "ack":  
-                entry["ack"] = status
-                entry["ack_detail"] = detail
-            return True
-        self._late_acks[pid] = (status, detail)
-        return False
+        with self._lock:
+            entry = self.pending_acks.get(pid)
+            if entry:
+                if entry["ack"] != "ack":
+                    entry["ack"] = status
+                    entry["ack_detail"] = detail
+                return True
+            self._late_acks[pid] = (status, detail)
+            return False
 
     def _apply_late_ack(self, packet_id: int, entry: dict):
-        """Apply buffered ACK if it arrived before store.add()."""
+
         pid = int(packet_id)
-        if pid in self._late_acks:
-            status, detail = self._late_acks.pop(pid)
-            entry["ack"] = status
-            entry["ack_detail"] = detail
+        with self._lock:
+            if pid in self._late_acks:
+                status, detail = self._late_acks.pop(pid)
+                entry["ack"] = status
+                entry["ack_detail"] = detail
 
     def mark_read(self, channel: str):
-        self.unread[channel] = 0
+        with self._lock:
+            self.unread[channel] = 0
 
     def get(self, channel: str) -> list:
-        return list(self.channels[channel])
+        with self._lock:
+            return list(self.channels[channel])
 
     def drop_channel(self, channel: str):
-        if channel in self.channels:
-            del self.channels[channel]
-        if channel in self.unread:
-            del self.unread[channel]
+        with self._lock:
+            if channel in self.channels:
+                del self.channels[channel]
+            if channel in self.unread:
+                del self.unread[channel]
+
+    def clear(self, channel: str):
+        with self._lock:
+            self.channels[channel].clear()
 
 
 # ── MESH INTERFACE WRAPPER ────────────────────────────────────────────────────
 
 def _extract_packet_id(result, store=None) -> Optional[int]:
-    """Extract packet id. store= optional MessageStore for debug logging."""
+
     def dbg(msg):
         if store:
             store.add("debug", ">>>DBG<<<", f"\n{'='*50}\n  EXTRACT_PID: {msg}\n{'='*50}", is_raw_debug=True)
@@ -450,7 +509,7 @@ class MeshInterface:
         self.my_id = "!local"
         self.my_name = "operator"
         self.nodes: dict = {}
-        self._excluded_nodes: set = set()        
+        self._excluded_nodes: set = set()
         self.connected = False
         self.channel_names: dict[int, str] = {0: "primary"}
         self.app_channels_callback = None
@@ -459,6 +518,7 @@ class MeshInterface:
         self._traceroute_sessions: dict[int, tuple] = {}
         self._last_conn_type: Optional[str] = None
         self._last_conn_target = None
+        self.raw_logging = True
 
     def _refresh_nodes(self) -> None:
         if self.iface and hasattr(self.iface, "nodes") and self.iface.nodes:
@@ -512,6 +572,8 @@ class MeshInterface:
         self._refresh_nodes()
 
     def _global_raw_logger(self, topic=pub.AUTO_TOPIC, **kwargs):
+        if not self.raw_logging:
+            return
         topic_name = topic.getName()
         clean_kwargs = {k: v for k, v in kwargs.items() if k != 'interface'}
         db.save_packet(topic_name, clean_kwargs)
@@ -533,7 +595,7 @@ class MeshInterface:
         if not self.connected:
             return
         self.connected = False
-        self.store.add("system", "sys", "[red]⚠ connection lost — reconnecting...[/red]")
+        self.store.add("system", "sys", "[red]⚠ connection lost — reconnecting...[/red]", markup=True)
         self.on_update()
         if getattr(self, "app", None):
             self.app.call_from_thread(self.app._start_reconnect_loop)
@@ -560,7 +622,7 @@ class MeshInterface:
         sender_id_raw = str(packet.get("fromId", ""))
         sender_norm = _normalize_node_id(sender_id_raw) if sender_id_raw else ""
 
-        # ── REPLY_APP pong (незашифрованные каналы) ──────────────────────────
+        # ── REPLY_APP pong ──────────────────────────
         is_reply_app = (portnum == "REPLY_APP" or portnum == 32)
         if is_reply_app:
             self._handle_pong(packet, sender_norm)
@@ -599,7 +661,7 @@ class MeshInterface:
                 self.app.call_from_thread(self.app._force_refresh_log)
             return
 
-        # ── нет текста — дамп в debug ────────────────────────────────────────
+
         if not text:
             self.store.add("debug", "raw",
                 f"[no-text pkt] portnum={portnum!r} from={sender_id_raw} "
@@ -608,7 +670,7 @@ class MeshInterface:
             self.on_update()
             return
 
-        # ── текстовое сообщение ──────────────────────────────────────────────
+
         raw_to_id = packet.get("toId")
         to_id = str(raw_to_id if raw_to_id is not None else "^all")
         rssi = packet.get("rxRssi")
@@ -693,10 +755,6 @@ class MeshInterface:
                     break
 
         label = "PONG"
-        hop_part  = hop_indicator(hops_away) if hops_away is not None else ""
-        snr_part  = snr_bar(snr) if snr is not None else ""
-        rssi_part = f"rssi:{rssi}" if rssi is not None else ""
-
         pong_line = f"{label}  rtt:{rtt_str}".strip()
         self.store.add(ping_tab, "pong", pong_line, rssi=rssi, snr=snr, hops=hops_away)
 
@@ -867,13 +925,13 @@ class SetupScreen(ModalScreen):
     DEFAULT_CSS = f"""
     SetupScreen {{
         align: center middle;
-        background: rgba(0, 0, 0, 0.75);
+        background: rgba(5, 10, 20, 0.85);
     }}
     #setup-dialog {{
         padding: 1 2;
         width: 60;
         height: auto;
-        background: #161b22;
+        background: #0a0a12;
         border: solid {C['accent']};
     }}
     .setup-title {{
@@ -886,8 +944,8 @@ class SetupScreen(ModalScreen):
     }}
     #conn-target-input {{
         margin: 1 0;
-        background: #0d1117;
-        border: solid {C['border']};
+        background: #0a0a12;
+        border: solid {C['accent2']};
     }}
     #btn-submit {{
         width: 1fr;
@@ -940,57 +998,88 @@ class NodePanel(ScrollableContainer):
     def update_nodes(self) -> None:
         self.remove_children()
 
-        header_text = Text.from_markup(f"  ◈ NODES\n", style=f"bold {C['accent']}")
-        header_text.append(f"  {'─'*18}\n", style=C["dim"])
-        self.mount(Static(header_text))
+        body = Text.from_markup(
+            f"[bold {C['accent']}]◉ KNOWN NODES:[/bold {C['accent']}]\n"
+            f"[{C['dim']}]  {'─' * 18}[/{C['dim']}]\n"
+        )
+
+        if not getattr(self.mesh, "iface", None):
+            body.append("  No mesh interface...\n", style=C["ghost"])
+            self.mount(Static(body))
+            return
 
         nodes = self.mesh.nodes
         if not nodes:
-            self.mount(Static("  no nodes visible\n", style=C["ghost"]))
-        else:
-            for node_id, info in list(nodes.items()):
-                str_id = str(node_id)
-                if isinstance(info, dict):
-                    user = info.get("user", info)
-                    name = user.get("longName", str_id[-6:])
-                    snr_val = info.get("snr", 0)
-                    hops = info.get("hopsAway", info.get("hop", 1))
-                else:
-                    name, snr_val, hops = str_id[-6:], 0, 1
+            body.append("  No active nodes...\n", style=C["ghost"])
+            self.mount(Static(body))
+            return
 
-                col = node_color(str_id)
-                short = name[:20].ljust(20)
+        def sort_key(item):
+            nid, info = item
+            if isinstance(info, dict):
+                user = info.get("user", {})
+                name = user.get("longName") or user.get("shortName", "")
+                if name:
+                    return name.lower()
+            nid_str = str(nid)
+            return (nid_str if nid_str.startswith("!") else f"!{nid_str}").lower()
 
-                node_text = Text(f"  ◈ {short}\n", style=col)
-                node_text.append(Text.from_markup(f"    {snr_bar(snr_val)} {hop_indicator(hops)}\n"))
-                self.mount(Static(node_text))
+        for nid, info in sorted(nodes.items(), key=sort_key):
+            if isinstance(info, dict):
+                user = info.get("user", {})
+                name = user.get("longName") or user.get("shortName", "")
+                snr = info.get("snr")
+                hops = info.get("hopsAway")
+                last_heard = info.get("lastHeard")
+            else:
+                name, snr, hops, last_heard = "", None, None, None
+            if not name:
+                name = str(nid)[-6:]
 
-        footer_text = Text(f"\n  {'─'*18}\n", style=C["dim"])
-        footer_text.append(f"  total: {len(nodes)}\n", style=C["ghost"])
-        footer_text.append(f"  self: {self.mesh.my_name[:14]}\n", style=f"{C['accent']}")
-        self.mount(Static(footer_text))
+            col = node_color(str(nid))
+            line = Text.from_markup(
+                f"[{col}]◈[/{col}] [bold {C['text']}]{markup_escape(_display_safe(name))[:10]}[/bold {C['text']}]"
+            )
+            if snr is not None:
+                snr_col = C["accent"] if snr >= 8 else (C["warn"] if snr >= 3 else C["danger"])
+                line.append_text(Text.from_markup(f" [{snr_col}]{snr:.0f}dB[/{snr_col}]"))
+            if hops is not None:
+                hcol = C["accent"] if hops == 0 else (C["accent2"] if hops == 1 else (C["warn"] if hops == 2 else C["ghost"]))
+                hs = {0: "◉0", 1: "◎1", 2: "○2"}.get(hops, f"·{hops}")
+                line.append_text(Text.from_markup(f" [{hcol}]{hs}[/{hcol}]"))
+            line.append_text(Text.from_markup(f" [{C['ghost']}]{_age_str(last_heard)}[/{C['ghost']}]"))
+            line.append("\n")
+            body.append_text(line)
 
+        body.append(f"\n  {'─' * 18}\n", style=C["dim"])
+        body.append(Text.from_markup(
+            f"  SNR [{C['accent']}]≥8[/{C['accent']}] [{C['warn']}]3-8[/{C['warn']}] [{C['danger']}]<3[/{C['danger']}]\n"
+            f"  hop [{C['accent']}]◉0[/{C['accent']}] [{C['accent2']}]◎1[/{C['accent2']}] [{C['warn']}]○2[/{C['warn']}]\n"
+        ))
+        body.append(f"  total: {len(nodes)}\n", style=C["ghost"])
+        body.append(f"  self: {self.mesh.my_name[:14]}\n", style=C["accent"])
 
-import math
+        self.mount(Static(body))
+
 
 class RadarWidget(Static):
-    
-    
+
+
     DEFAULT_CSS = """
     RadarWidget {
         width: 1fr;
         height: 1fr;
-        background: #0d1117;
+        background: #0a0a12;
         padding: 0;
         margin: 0;
         border: none;
         display: none;
     }
     """
-    
+
     MYCITY_LAT = 57.0004
     MYCITY_LON = 40.9739
-    
+
     def __init__(self, mesh: MeshInterface, **kwargs):
         super().__init__(**kwargs)
         self.mesh = mesh
@@ -1002,15 +1091,15 @@ class RadarWidget(Static):
 
     def on_mount(self):
         self.set_interval(2.0, self.update_radar)
-    
+
     def on_resize(self, event) -> None:
         if self.display:
             self.update_radar()
-        
+
     def action_zoom_in(self):
         self.zoom = max(100, self.zoom / 1.5)
         self.update_radar()
-        
+
     def action_zoom_out(self):
         self.zoom = min(100000, self.zoom * 1.5)
         self.update_radar()
@@ -1035,34 +1124,36 @@ class RadarWidget(Static):
         self.pan_x = 0.0
         self.pan_y = 0.0
         self.update_radar()
-        
+
     def update_radar(self):
         my_pos = self._get_center_position()
         nodes_with_pos = []
-        
+
         for nid, info in self.mesh.nodes.items():
             if str(nid) == str(self.mesh.my_id):
                 continue
             pos = self._extract_position(info)
             if not pos:
                 continue
-            dist = self._haversine(my_pos[0], my_pos[1], pos[0], pos[1])
-            snr = None
             name = ""
+            snr = None
+            age = ""
             if isinstance(info, dict):
                 user = info.get("user", {})
                 name = (user.get("shortName") or user.get("longName", ""))[:5]
-            nodes_with_pos.append((nid, pos[0], pos[1], name))
-            
+                snr = info.get("snr")
+                age = _age_str(info.get("lastHeard", 0))
+            nodes_with_pos.append((nid, pos[0], pos[1], name, snr, age))
+
         nodes_with_pos.sort(key=lambda x: x[3], reverse=True)
-        
+
         size = self.size
         w = max(size.width - 2, 20) if size.width > 10 else self.width_chars
         h = max(size.height - 2, 10) if size.height > 6 else self.height_chars
-        
+
         canvas = [[" " for _ in range(w)] for _ in range(h)]
         cx, cy = w // 2, h // 2
-        
+
         for x in range(0, w, 8):
             for y in range(h):
                 canvas[y][x] = f"[{C['dim']}]·[/]"
@@ -1070,39 +1161,45 @@ class RadarWidget(Static):
             for x in range(w):
                 if canvas[y][x] == " ":
                     canvas[y][x] = f"[{C['dim']}]·[/]"
-                    
+
         canvas[cy][cx] = f"[bold {C['accent']}]◉[/]"
-        
+
         placed_rects = [(cx - 1, cy - 1, cx + 2, cy + 2)]
         cos_lat = math.cos(math.radians(my_pos[0]))
-        
-        for nid, lat, lon, name in nodes_with_pos:
+
+        for nid, lat, lon, name, snr, age in nodes_with_pos:
             d_lat = (lat - my_pos[0]) * 111_000 - self.pan_y
             d_lon = (lon - my_pos[1]) * 111_000 * cos_lat - self.pan_x
-        
+
             scale = min(w / 2, h / 2)
             px = int(cx + (d_lon / self.zoom) * scale)
             py = int(cy - (d_lat / self.zoom) * scale)
-            
+
             if not (0 <= px < w and 0 <= py < h):
                 continue
-                
+
             col = node_color(str(nid))
             canvas[py][px] = f"[{col}]●[/]"
-            
-            snr_str = f"{snr:.0f}dB" if snr is not None else "?dB"
-            label =  f"{markup_escape(name)}"
-            
+
+            label = markup_escape(name)
+            meta = ""
+            if snr is not None:
+                meta = f"{snr:.0f}dB"
+            if age:
+                meta = f"{meta} {age}" if meta else age
+            meta_col = C["accent"] if (snr is not None and snr >= 8) else (C["warn"] if (snr is not None and snr >= 3) else (C["danger"] if snr is not None else C["ghost"]))
+            full_w = len(label) + (1 + len(meta) if meta else 0)
+
             best_pos = None
             offsets = [
-                (2, 0), (-len(label) - 1, 0),
-                (2, -1), (-len(label) - 1, -1),
-                (2, 1), (-len(label) - 1, 1),
+                (2, 0), (-full_w - 1, 0),
+                (2, -1), (-full_w - 1, -1),
+                (2, 1), (-full_w - 1, 1),
             ]
             for dx, dy in offsets:
                 lx, ly = px + dx, py + dy
-                if 0 <= lx <= w - len(label) and 0 <= ly < h:
-                    rect = (lx, ly, lx + len(label), ly + 1)
+                if 0 <= lx <= w - full_w and 0 <= ly < h:
+                    rect = (lx, ly, lx + full_w, ly + 1)
                     overlap = any(
                         not (rect[2] < r[0] or rect[0] > r[2] or
                              rect[3] < r[1] or rect[1] > r[3])
@@ -1112,30 +1209,35 @@ class RadarWidget(Static):
                         best_pos = (lx, ly)
                         placed_rects.append(rect)
                         break
-                        
+
             if best_pos:
                 lx, ly = best_pos
                 for i, ch in enumerate(label):
                     if 0 <= lx + i < w:
                         canvas[ly][lx + i] = f"[dim {col}]{ch}[/]"
-                        
+                if meta:
+                    mx = lx + len(label) + 1
+                    for j, ch in enumerate(meta):
+                        if 0 <= mx + j < w:
+                            canvas[ly][mx + j] = f"[{meta_col}]{ch}[/]"
+
         lines = ["".join(row) for row in canvas]
         mode = "[NOGPS: IVANOVO]" if not self._has_real_gps() else "[GPS LIVE]"
         pan_info = f" pan:{self.pan_x/1000:.1f}km,{self.pan_y/1000:.1f}km" if (self.pan_x or self.pan_y) else ""
         header = f"[bold {C['accent2']}]⟁ RADAR[/] zoom:{self.zoom:.0f}m{pan_info} | [Ctrl+U/O] zoom | [Ctrl+↑↓←→] pan | {mode}"
         footer = f"[{C['ghost']}]Nodes w/GPS: {len(nodes_with_pos)} | Center: YOU[/]"
-        
+
         self.update(f"{header}\n" + "\n".join(lines) + f"\n{footer}")
-        
+
     def _get_center_position(self):
         real = self._get_my_real_position()
         if real:
             return real
         return (self.MYCITY_LAT, self.MYCITY_LON)
-        
+
     def _has_real_gps(self):
         return self._get_my_real_position() is not None
-        
+
     def _get_my_real_position(self):
         if not self.mesh.iface:
             return None
@@ -1146,7 +1248,7 @@ class RadarWidget(Static):
         except Exception:
             pass
         return None
-        
+
     def _extract_position(self, info):
         if not isinstance(info, dict):
             return None
@@ -1159,37 +1261,29 @@ class RadarWidget(Static):
             if -90 <= lat <= 90 and -180 <= lon <= 180:
                 return (lat, lon)
         return None
-        
-    def _haversine(self, lat1, lon1, lat2, lon2):
-        R = 6371000
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlam = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
-        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 # ── MAIN APPLICATION ──────────────────────────────────────────────────────────
 
 class MeshApp(App):
     CSS = f"""
-    #header {{ 
-        background: #161b22; 
-        color: #e2e8f0; 
-        height: 2; 
-        padding: 0 1; 
-        border-bottom: solid #4a5568;
+    #header {{
+        background: #0a0a12;
+        color: {C['text']};
+        height: 3;
+        padding: 0 1;
+        border-bottom: solid {C['border']};
     }}
-    Screen {{ background: #0d1117; }}
+    Screen {{ background: #0a0a12; }}
     #main {{ height: 1fr; }}
-    #chat-col {{ width: 1fr; border-right: solid {C['border']}; }}
-    #log {{ height: 1fr; background: #0d1117; padding: 0 1; scrollbar-color: {C['dim']}; scrollbar-size: 1 1; }}
-    #node-col {{ width: 26; background: #0d1117; scrollbar-color: #3d4451; scrollbar-size: 1 1; }}
-    #input-row {{ height: 3; border-top: solid {C['border']}; background: #0d1117; padding: 0 1; }}
-    #prompt {{ color: {C['accent']}; width: 10; padding: 1 0; text-style: bold; }}
-    Input {{ background: #0d1117; border: none; color: {C['text']}; height: 3; padding: 1 0; }}
+    #chat-col {{ width: 1fr; }}
+    #log {{ height: 1fr; background: #0a0a12; padding: 0 1; scrollbar-size: 0 0; border: round {C['accent']}; }}
+    #node-col {{ width: 26; background: #0a0a12; scrollbar-color: {C['accent2']}; scrollbar-size: 1 1; }}
+    #input-row {{ height: 3; border-top: solid {C['border']}; border-right: solid {C['accent']}; background: #0a0a12; padding: 0 1; }}
+    #prompt {{ color: {C['accent']}; width: 12; padding: 1 0; text-style: bold; }}
+    Input {{ background: #0a0a12; border: none; color: {C['text']}; height: 3; padding: 1 0; }}
     Input:focus {{ border: none; }}
-    #statusbar {{ height: 1; background: #161b22; color: {C['ghost']}; padding: 0 1; }}
-    #channel-bar {{ height: 1; background: #161b22; padding: 0 1; }}
+    #statusbar {{ height: 1; background: #0e0e1a; color: {C['ghost']}; padding: 0 1; }}
+    #channel-bar {{ height: 1; background: #0e0e1a; color: {C['text']}; padding: 0 1; }}
     #radar-view {{ width: 1fr; height: 1fr; display: none; }}
     """
 
@@ -1207,6 +1301,15 @@ class MeshApp(App):
         Binding("ctrl+left",  "radar_pan_left",  "map←", show=False),
         Binding("ctrl+right", "radar_pan_right", "map→", show=False),
         Binding("f1",     "show_help",    "help",       show=True),
+        Binding("ctrl+1", "jump_channel(1)", "ch 1", show=False),
+        Binding("ctrl+2", "jump_channel(2)", "ch 2", show=False),
+        Binding("ctrl+3", "jump_channel(3)", "ch 3", show=False),
+        Binding("ctrl+4", "jump_channel(4)", "ch 4", show=False),
+        Binding("ctrl+5", "jump_channel(5)", "ch 5", show=False),
+        Binding("ctrl+6", "jump_channel(6)", "ch 6", show=False),
+        Binding("ctrl+7", "jump_channel(7)", "ch 7", show=False),
+        Binding("ctrl+8", "jump_channel(8)", "ch 8", show=False),
+        Binding("ctrl+9", "jump_channel(9)", "ch 9", show=False),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -1258,7 +1361,7 @@ class MeshApp(App):
                 ok = self.mesh.connect_serial(self.mesh._last_conn_target)
 
             if ok:
-                self.store.add("system", "sys", "[green]✓ reconnected[/green]")
+                self.store.add("system", "sys", "[green]✓ reconnected[/green]", markup=True)
                 self._reconnect_timer.stop()
                 self._reconnect_timer = None
         except Exception as e:
@@ -1296,21 +1399,32 @@ class MeshApp(App):
             with Vertical(id="chat-col"):
                 yield RichLog(id="log", wrap=True, highlight=False, markup=True)
                 with Horizontal(id="input-row"):
-                    yield Static(f"[{C['accent']}]mesh ›[/] ", id="prompt", markup=True)
-                    yield Input(placeholder="type msg, :dm <name/id> or :help", id="msg-input")
-            yield RadarWidget(self.mesh, id="radar-view")   
+                    yield Static(f"[blink {C['accent']}]▮[/blink {C['accent']}] [bold {C['accent']}]TX[/bold {C['accent']}] [{C['ghost']}]›[/{C['ghost']}] ", id="prompt", markup=True)
+                    yield Input(placeholder="// transmit · :dm <id> · :help", id="msg-input")
+            yield RadarWidget(self.mesh, id="radar-view")
             yield NodePanel(self.mesh, id="node-col")
         yield Static("", id="statusbar")
 
-    
+
     def _header_art(self) -> str:
-        logo = f"[bold {C['hi']}]▰▰ meshtastic cli client[/bold {C['hi']}]"
-        mode = f"[{C['accent']}]⟁ AUTONOMOUS MODE[/{C['accent']}]"
-        manifest = f"[{C['ghost']}]{random.choice(MANIFESTS)}[/{C['ghost']}]"
-        return f" {logo} │ {mode} ── {manifest}"
+        logo = (
+            f"[bold {C['accent']}]▞▚ MESHTASTIC[/bold {C['accent']}]"
+            f"[{C['ghost']}]//[/{C['ghost']}]"
+            f"[bold {C['accent2']}]NODE.CLI[/bold {C['accent2']}]"
+        )
+        mode = f"[{C['hi']}]⟁ AUTONOMOUS MODE[/{C['hi']}]"
+        manifest = f"[{C['meta']}]{random.choice(MANIFESTS)}[/{C['meta']}]"
+        cursor = f"[blink {C['accent']}]▮[/blink {C['accent']}]"
+        return f" {logo}   {mode} {cursor}\n {manifest}"
+
+    def _rotate_manifest(self):
+        try:
+            self.query_one("#header", Static).update(self._header_art())
+        except Exception:
+            pass
 
     def on_mount(self):
-        # Сначала загружаем историю в store — до любой отрисовки
+
         for ch in self.channels:
             if ch not in ("system", "debug"):
                 self.store.load_history(ch)
@@ -1319,8 +1433,6 @@ class MeshApp(App):
         self._refresh_status()
         self._refresh_nodes()
 
-        # Откладываем первую отрисовку лога до следующего тика Textual,
-        # когда все виджеты гарантированно смонтированы и размеры известны
         self.call_after_refresh(self._initial_render)
 
         conn_type = db.get_setting("conn_type")
@@ -1333,6 +1445,7 @@ class MeshApp(App):
 
         self.set_interval(0.5, self._refresh_status)
         self.set_interval(0.2, self._poll_updates)
+        self.set_interval(120.0, self._rotate_manifest)
         self.query_one("#msg-input", Input).focus()
         self._update_chat_view()
 
@@ -1344,7 +1457,7 @@ class MeshApp(App):
         self._connect_to_mesh(result["type"], result["target"])
 
     def _initial_render(self):
-        """Вызывается после первого refresh Textual — виджеты точно готовы."""
+
         self._rendered_count.clear()
         self._refresh_log(force=True)
 
@@ -1354,8 +1467,8 @@ class MeshApp(App):
             try:
                 self.mesh.connect_serial(conn_target)
             except Exception as e:
-                self.store.add("system", "sys", f"[red]❌ Serial connection failed: {e}[/red]")
-        
+                self.store.add("system", "sys", f"[red]❌ Serial connection failed: {markup_escape(str(e))}[/red]", markup=True)
+
         elif conn_type == "tcp":
             if ":" in conn_target:
                 host, port_str = conn_target.split(":", 1)
@@ -1369,7 +1482,6 @@ class MeshApp(App):
             self._refresh_log()
 
             try:
-                time.sleep(0.5) 
                 if self.mesh.connect_tcp(host, port):
                     self.store.add("system", "sys", "✓ Connected to Meshtastic via TCP!")
                 else:
@@ -1398,18 +1510,30 @@ class MeshApp(App):
             log.write(t)
             return
 
+        if m.get("renderable") is not None:
+            log.write(m["renderable"])
+            return
+
         t = Text()
         t.append(f" {m['ts']} ", style=C["ghost"])
+        sender_str = str(m["sender"])
+        max_hop = None
+        if sender_str in self.mesh.nodes:
+            node_info = self.mesh.nodes[sender_str]
+            if isinstance(node_info, dict):
+                max_hop = node_info.get("hopLimit")
 
         if m["sender"] == "sys":
             t.append("◈ ", style=C["warn"])
-            t.append(m["text"], style=C["warn"])
+            if m.get("markup"):
+                t.append_text(Text.from_markup(m["text"]))
+            else:
+                t.append(_display_safe(m["text"]), style=C["warn"])
             log.write(t)
             return
 
-        sender_str = str(m["sender"])
         if sender_str == str(self.mesh.my_id):
-            name = self.mesh.my_name[:20]
+            name = _display_safe(self.mesh.my_name[:20])
             t.append(f"▸ {name:<21}", style=f"bold {C['accent']}")
         else:
             node_info = self.mesh.nodes.get(m["sender"])
@@ -1423,9 +1547,9 @@ class MeshApp(App):
                 display_sender = sender_str[-6:]
 
             col = node_color(sender_str)
-            t.append(f"  {display_sender[:20]:<21}", style=col)
+            t.append(f"  {_display_safe(display_sender)[:20]:<21}", style=col)
 
-        t.append(m["text"], style=C["text"])
+        t.append(_display_safe(m["text"]), style=C["text"])
 
         meta_parts = []
         if m.get("rssi") is not None:
@@ -1436,8 +1560,10 @@ class MeshApp(App):
             h = m["hops"]
             hop_str = "◉direct" if h == 0 else f"⬡×{h}"
             meta_parts.append(hop_str)
+        if max_hop is not None and max_hop != 7:  # 7 — стандартный лимит, не показываем его
+            meta_parts.append(f"maxH:{max_hop}")
         if meta_parts:
-            t.append(f"  [{' '.join(meta_parts)}]", style=C["dim"])
+            t.append(f"  [{' '.join(meta_parts)}]", style=C["meta"])
 
         if m.get("is_own"):
             ack = m.get("ack")
@@ -1483,8 +1609,7 @@ class MeshApp(App):
 
         rendered = self._rendered_count.get(ch, 0)
 
-        # Полная перерисовка нужна если: явный force, первый раз, или последнее
-        # своё сообщение изменило статус (ACK пришёл)
+
         last_own_changed = (
             msgs[-1].get("is_own") and rendered > 0
         )
@@ -1496,13 +1621,13 @@ class MeshApp(App):
             self._rendered_count[ch] = len(msgs)
             return
 
-        # Дописываем только новые сообщения
+
         delta = len(msgs) - rendered
         if delta > 0:
             for m in msgs[-delta:]:
                 self._write_msg(log, m)
             self._rendered_count[ch] = len(msgs)
-	
+
     def _refresh_channel_bar(self):
         bar = self.query_one("#channel-bar", Static)
         parts = []
@@ -1513,135 +1638,24 @@ class MeshApp(App):
                 raw_id = ch[1:]
                 node_info = self.mesh.nodes.get(raw_id) or self.mesh.nodes.get(int(raw_id) if raw_id.isdigit() else 0)
                 if isinstance(node_info, dict):
-                    display_name = f"▶{node_info.get('user', {}).get('longName', raw_id[-6:])}"
+                    display_name = f"▶{_display_safe(node_info.get('user', {}).get('longName', raw_id[-6:]))}"
                 else:
-                    display_name = f"▶{raw_id[-6:]}"
+                    display_name = f"▶{_display_safe(raw_id[-6:])}"
 
             if i == self.ch_index:
-                badge = f"[bold {C['accent']}] #{display_name} [/bold {C['accent']}]"
+                badge = f"[reverse {C['accent']}] {display_name} [/]"
             else:
-                badge = f"[{C['ghost']}] #{display_name} [/{C['ghost']}]"
+                badge = f"[{C['ghost']}] {display_name} [/]"
             if unread > 0 and ch != "debug":
                 badge += f"[{C['danger']}]{unread}[/{C['danger']}]"
             parts.append(badge)
         bar.update(" ".join(parts))
 
-    def _update_chat_view(self):
-        try:
-            log = self.query_one("#log", RichLog)
-            radar = self.query_one("#radar-view", RadarWidget)
-            input_row = self.query_one("#input-row")
-            if self.current_channel == "map":
-                log.display = False
-                input_row.display = False
-                radar.display = True                   
-                radar.refresh()
-                radar.update_radar()
-            else:
-                log.display = True
-                input_row.display = True
-                radar.display = False
-        except Exception:
-            pass
-
-
-    def action_radar_zoom_in(self):
-        try:
-            self.query_one("#radar-view", RadarWidget).action_zoom_in()
-        except Exception:
-            pass
-
-    def action_radar_zoom_out(self):
-        try:
-            self.query_one("#radar-view", RadarWidget).action_zoom_out()
-        except Exception:
-            pass
-
     def _refresh_nodes(self):
         try:
-            panel = self.query_one("#node-col")
+            self.query_one("#node-col", NodePanel).update_nodes()
         except Exception:
-            return
-
-        nodes_widget = None
-        for widget_type in ["RichLog", "TextLog", "Static", "Label"]:
-            try:
-                from textual.widgets import RichLog, Static, Label
-                target_class = locals().get(widget_type)
-                if target_class:
-                    nodes_widget = panel.query_one(target_class)
-                    break
-            except Exception:
-                continue
-
-        if not nodes_widget:
-            nodes_widget = panel
-
-        try:
-            if hasattr(nodes_widget, "clear"):
-                nodes_widget.clear()
-
-            write_func = getattr(nodes_widget, "write", getattr(nodes_widget, "update", None))
-            if not write_func:
-                return
-
-            lines = [f"[bold #38bdf8]📡 KNOWN NODES:[/bold #38bdf8]"]
-
-            if not hasattr(self, 'mesh') or not self.mesh or not getattr(self.mesh, 'iface', None):
-                lines.append("  [gray]No mesh interface...[/gray]")
-                write_func("\n".join(lines))
-                return
-
-            nodes_dict = self.mesh.nodes
-
-            if not nodes_dict:
-                lines.append("  [gray]No active nodes...[/gray]")
-                write_func("\n".join(lines))
-                return
-
-            output = Text.from_markup("\n".join(lines) + "\n")
-
-            # Сортируем по имени ноды в алфавитном порядке (регистронезависимо)
-            def get_node_name_key(item):
-                nid, info_dict = item
-                if isinstance(info_dict, dict):
-                    user_info = info_dict.get("user", {})
-                    name = user_info.get("longName") or user_info.get("shortName", "")
-                    if name:
-                        return name.lower()
-                # fallback — hex id
-                nid_str = str(nid)
-                return (nid_str if nid_str.startswith("!") else f"!{nid_str}").lower()
-
-            sorted_nodes = sorted(nodes_dict.items(), key=get_node_name_key)
-
-            for nid, info in sorted_nodes:
-                if isinstance(info, dict):
-                    user_info = info.get("user", {})
-                    
-                    # Безопасное определение имени и Hex ID ноды
-                    if user_info.get("longName") or user_info.get("shortName"):
-                        name = user_info.get("longName") or user_info.get("shortName")
-                    else:
-                        # Защита от string/int несоответствия:
-                        if isinstance(nid, int):
-                            name = f"!{nid:08x}"
-                        else:
-                            # Если nid уже строка, проверяем, есть ли восклицательный знак в начале
-                            nid_str = str(nid)
-                            name = nid_str if nid_str.startswith("!") else f"!{nid_str}"
-
-                    snr = info.get("snr", 0.0)
-                    line = Text()
-                    line.append(" ", style="bold #e2e8f0")
-                    line.append(name, style="bold #e2e8f0")
-                    line.append(f" ({snr}dB)\n", style="#808080")
-                    output.append_text(line)
-
-            write_func(output)
-
-        except Exception as final_err:
-            self.store.add("system", "debug", f"Render error: {final_err}")
+            pass
 
     def action_open_dm(self, node_id: str) -> None:
         target_id = str(node_id)
@@ -1665,18 +1679,17 @@ class MeshApp(App):
             statusbar = self.query_one("#statusbar")
         except Exception:
             return
-        
 
-        now = datetime.now(MOSCOW_TZ)
+
         now = datetime.now(MOSCOW_TZ)
         time_str = now.strftime("%H:%M:%S")
-        date_str = now.strftime("%d.%m.%y")
 
         last_ext = getattr(self, "last_external_packet_time", None)
-        last_ext_str = last_ext.strftime("%d.%m.%y %H:%M:%S") if last_ext else "—"
+        last_ext_str = _age_str(last_ext.timestamp()) if last_ext else "—"
 
         my_hex_id = "!local"
         long_name = "Operator"
+        my_snr = None
 
         if hasattr(self, 'mesh') and self.mesh:
             nid = self.mesh.my_id
@@ -1694,17 +1707,44 @@ class MeshApp(App):
                         my_details = self.mesh.iface.nodes[my_node_num]
                         user_info = my_details.get("user", {})
                         long_name = user_info.get("longName", long_name)
+                        my_snr = my_details.get("snr")
                 except Exception:
                     long_name = getattr(self.mesh, 'my_name', long_name)
 
-        status_text = (
-            f"[bold #38bdf8]MYID:[/bold #38bdf8] {my_hex_id}  "
-            f"[bold #e2e8f0]MYNAME:[/bold #e2e8f0] {long_name}  |  "
-            f"[bold #ae7cff]{date_str} {time_str} (MSK)[/bold #ae7cff]  |  "
-            f"[bold #7cffae]LAST EXT PACKET:[/bold #7cffae] {last_ext_str}"
-        )
+        connected = getattr(self.mesh, "connected", False)
+        link_color = C["accent"] if connected else C["danger"]
+        link_label = "ONLINE" if connected else "OFFLINE"
+        link_dot = "●" if connected else "○"
+
+        parts = [
+            f"[bold {link_color}]{link_dot} {link_label}[/bold {link_color}]",
+            f"[bold {C['accent']}]MYID[/bold {C['accent']}] {my_hex_id}",
+            f"[bold {C['accent2']}]MYNAME[/bold {C['accent2']}] {_display_safe(long_name)}",
+        ]
+        if my_snr is not None:
+            parts.append(f"[bold {C['meta']}]SNR {my_snr:.0f}dB[/bold {C['meta']}]")
+        parts.append(f"[bold {C['hi']}]{time_str} MSK[/bold {C['hi']}]")
+        parts.append(f"[bold {C['meta']}]PKT {last_ext_str}[/bold {C['meta']}]")
+
+        status_text = "  ".join(parts)
 
         if hasattr(statusbar, "update"): statusbar.update(status_text)
+
+    def _update_prompt(self, focused: bool):
+        try:
+            prompt = self.query_one("#prompt", Static)
+            cursor = f"[blink {C['accent']}]▮[/blink {C['accent']}]" if focused else f"[{C['dim']}]▮[/{C['dim']}]"
+            prompt.update(f"{cursor} [bold {C['accent']}]TX[/bold {C['accent']}] [{C['ghost']}]›[/{C['ghost']}] ")
+        except Exception:
+            pass
+
+    def on_focus(self, event):
+        if getattr(event.widget, "id", None) == "msg-input":
+            self._update_prompt(True)
+
+    def on_blur(self, event):
+        if getattr(event.widget, "id", None) == "msg-input":
+            self._update_prompt(False)
 
     def _close_current_dm(self):
         target_ch = self.current_channel
@@ -1823,335 +1863,317 @@ class MeshApp(App):
             self.store.add(self.current_channel, "sys", "Message sending failed.")
         self._refresh_log()
 
+    def _resolve_node(self, target: str) -> Optional[str]:
+        """Resolve a node by :nodes index, hex id or long/short name -> !hexid."""
+        if not target:
+            return None
+        t = target.strip()
+        if hasattr(self, "_node_index_map") and t in self._node_index_map:
+            return _normalize_node_id(self._node_index_map[t])
+        tl = t.lower()
+        for nid, info in self.mesh.nodes.items():
+            if not isinstance(info, dict):
+                continue
+            u = info.get("user", {})
+            if tl in ((u.get("longName") or "").lower(), (u.get("shortName") or "").lower()):
+                return _normalize_node_id(str(nid))
+        return _normalize_node_id(t)
+
+    def _open_dm_tab(self, resolved_id: str) -> str:
+        dm_tab = f"▶{resolved_id}"
+        self._register_dm_tab(dm_tab)
+        if dm_tab in self.channels:
+            self.ch_index = self.channels.index(dm_tab)
+        self.query_one("#log", RichLog).clear()
+        self._refresh_log()
+        return dm_tab
+
+
+    def _cmd_quit(self, args):
+        self.action_quit()
+
+    def _cmd_close(self, args):
+        self._close_current_dm()
+
+    def _cmd_debug(self, args):
+        if args and args[0].lower() in ("on", "1"):
+            self.mesh.raw_logging = True
+        elif args and args[0].lower() in ("off", "0"):
+            self.mesh.raw_logging = False
+        else:
+            self.mesh.raw_logging = not self.mesh.raw_logging
+        self.store.add("system", "sys", f"raw debug logging: {'ON' if self.mesh.raw_logging else 'OFF'}")
+        self._refresh_log()
+
+    def _cmd_nodeclean(self, args):
+        if not args:
+            self.store.add("system", "sys", "Usage: :nodeclean <days>")
+            self._refresh_log()
+            return
+        try:
+            days = int(args[0])
+            self._run_node_clean(days)
+        except ValueError:
+            self.store.add("system", "sys", "Ошибка: укажите количество дней числом. Пример: :nodeclean 7")
+        self._refresh_log()
+
+    def _cmd_serial(self, args):
+        if not args:
+            self.store.add("system", "sys", "Usage: :serial <port>")
+            self._refresh_log()
+            return
+        port = args[0]
+        self.store.add("system", "sys", f"connecting serial {port}…")
+        ok = self.mesh.connect_serial(port)
+        if ok:
+            db.set_setting("conn_type", "serial")
+            db.set_setting("conn_target", port)
+            self.store.add("system", "sys", "serial link established and saved as default")
+        else:
+            self.store.add("system", "sys", "serial failed")
+        self._refresh_log()
+
+    def _cmd_tcp(self, args):
+        if not args:
+            self.store.add("system", "sys", "Usage: :tcp <host> [port]")
+            self._refresh_log()
+            return
+        host = args[0]
+        try:
+            port = int(args[1]) if len(args) > 1 else 4403
+        except ValueError:
+            self.store.add("system", "sys", "Ошибка: неверный порт.")
+            self._refresh_log()
+            return
+        self.store.add("system", "sys", f"connecting tcp {host}:{port}…")
+        ok = self.mesh.connect_tcp(host, port)
+        if ok:
+            db.set_setting("conn_type", "tcp")
+            db.set_setting("conn_target", f"{host}:{port}")
+            self.store.add("system", "sys", "tcp link established and saved as default")
+        else:
+            self.store.add("system", "sys", "tcp failed")
+        self._refresh_log()
+
+    def _cmd_ch(self, args):
+        if not args:
+            self.store.add("system", "sys", "Usage: :ch <name>")
+            self._refresh_log()
+            return
+        ch = args[0].lstrip("#").lower()
+        if ch not in self.channels:
+            idx = self.channels.index("system")
+            self.channels.insert(idx, ch)
+            self.store.load_history(ch)
+        self.ch_index = self.channels.index(ch)
+        self.store.add("system", "sys", f"switched to #{ch}")
+        self.query_one("#log", RichLog).clear()
+        self._refresh_log()
+        self._refresh_channel_bar()
+
+    def _cmd_nodes(self, args):
+        self._node_index_map = {}
+        sorted_nodes = sorted(
+            [(nid, info) for nid, info in self.mesh.nodes.items() if isinstance(info, dict)],
+            key=lambda x: x[1].get("lastHeard", 0)
+        )
+        total = len(sorted_nodes)
+
+        table = Table(
+            show_header=True,
+            header_style=f"bold {C['accent']}",
+            border_style=C["dim"],
+            box=None,
+            expand=False,
+            pad_edge=False,
+            padding=(0, 1),
+        )
+        table.add_column("#", style=C["accent"], justify="right", width=3)
+        table.add_column("NODE", style=f"bold {C['text']}", width=12, overflow="ellipsis")
+        table.add_column("ID", style=C["ghost"], width=9)
+        table.add_column("SNR", justify="right", width=5)
+        table.add_column("HOPS", width=5)
+        table.add_column("HEARD", style=C["ghost"], justify="right", width=6)
+
+        for idx_offset, (nid, info) in enumerate(sorted_nodes):
+            idx = total - idx_offset
+            str_nid = str(nid)
+            u = info.get("user", info)
+            name = u.get("longName") or str_nid[-6:]
+            snr_val = info.get("snr")
+            hops = info.get("hopsAway")
+
+            if snr_val is not None:
+                snr_txt = f"{snr_val:.0f}dB"
+                snr_col = C["accent"] if snr_val >= 8 else (C["warn"] if snr_val >= 3 else C["danger"])
+            else:
+                snr_txt = "—"
+                snr_col = C["ghost"]
+
+            hops_txt = {0: "◉0", 1: "◎1", 2: "○2"}.get(hops, f"·{hops}") if hops is not None else "—"
+            hops_col = C["accent"] if hops == 0 else (C["accent2"] if hops == 1 else (C["warn"] if hops == 2 else C["ghost"]))
+
+            self._node_index_map[str(idx)] = str_nid
+
+            table.add_row(
+                f"{idx:02d}",
+                Text(markup_escape(_display_safe(name))[:16], style=node_color(str_nid)),
+                f"!{str_nid[-8:]}",
+                Text(snr_txt, style=snr_col),
+                Text(hops_txt, style=hops_col),
+                _age_str(info.get("lastHeard", 0)),
+            )
+
+        self.store.add("system", "sys", f"[bold {C['accent']}]◉ NODE TABLE · {total}[/bold {C['accent']}]", markup=True)
+        self.store.add("system", "sys", "", renderable=table)
+        self.ch_index = self.channels.index("system")
+        self.query_one("#log", RichLog).clear()
+        self._refresh_log()
+
+    def _cmd_addfav(self, args):
+        if not args:
+            self.store.add("system", "sys", "Usage: :addfav <name/id/index>")
+            self._refresh_log()
+            return
+        target = args[0].strip()
+        resolved_id = self._resolve_node(target)
+        if not resolved_id:
+            self.store.add("system", "sys", f"✗ addfav: нода не найдена: {target}")
+            self._refresh_log()
+            return
+        node_info = self.mesh.nodes.get(resolved_id, {})
+        label = resolved_id
+        if isinstance(node_info, dict):
+            label = node_info.get("user", {}).get("longName", resolved_id)
+        self._favorites[resolved_id] = label
+        db.add_favorite(resolved_id, label)
+        self.store.add("system", "sys", f"★ Добавлено в избранное: {label} ({resolved_id})")
+        self._refresh_log()
+
+    def _cmd_delfav(self, args):
+        if not args:
+            self.store.add("system", "sys", "Usage: :delfav <name/id>")
+            self._refresh_log()
+            return
+        target = args[0].strip()
+        found_id = None
+        for fid, flabel in self._favorites.items():
+            if target.lstrip("!") in fid.lstrip("!") or target.lower() == flabel.lower():
+                found_id = fid
+                break
+        if not found_id:
+            self.store.add("system", "sys", f"✗ delfav: не найдено в избранном: {target}")
+        else:
+            label = self._favorites.pop(found_id)
+            db.remove_favorite(found_id)
+            self.store.add("system", "sys", f"✩ Удалено из избранного: {label} ({found_id})")
+        self._refresh_log()
+
+    def _cmd_favs(self, args):
+        if not self._favorites:
+            self.store.add("system", "sys", "★ Избранных нод нет.")
+        else:
+            self.store.add("system", "sys", f"★ Избранные ноды ({len(self._favorites)}):")
+            for fid, flabel in self._favorites.items():
+                self.store.add("system", "sys", f"   {flabel:<20} {fid}")
+        self.ch_index = self.channels.index("system")
+        self.query_one("#log", RichLog).clear()
+        self._refresh_log()
+
+    def _cmd_ping(self, args):
+        target = " ".join(args).strip()
+        if not target:
+            self.store.add("system", "sys", "Usage: :ping <name/id/index>")
+            self._refresh_log()
+            return
+        resolved_id = self._resolve_node(target)
+        dm_tab = self._open_dm_tab(resolved_id)
+        display_name = resolved_id
+        for nid, info in self.mesh.nodes.items():
+            if _normalize_node_id(str(nid)) == resolved_id and isinstance(info, dict):
+                display_name = info.get("user", {}).get("longName", resolved_id)
+                break
+        self.store.add(dm_tab, "ping", f"PING → {display_name}  waiting…")
+        self._refresh_log()
+        pid = self.mesh.send_ping(resolved_id)
+        if pid is not None:
+            self.mesh._ping_sessions[pid] = (resolved_id, time.time(), dm_tab)
+            self.store.add(dm_tab, "ping", f"sent  packet_id={pid}")
+        else:
+            self.store.add(dm_tab, "ping", "✗ ping send failed (not connected?)")
+        self._refresh_log()
+
+    def _cmd_tracert(self, args):
+        target = " ".join(args).strip()
+        if not target:
+            self.store.add("system", "sys", "Usage: :tracert <name/id/index>")
+            self._refresh_log()
+            return
+        resolved_id = self._resolve_node(target)
+        dm_tab = self._open_dm_tab(resolved_id)
+        display_name = resolved_id
+        for nid, info in self.mesh.nodes.items():
+            if _normalize_node_id(str(nid)) == resolved_id and isinstance(info, dict):
+                display_name = info.get("user", {}).get("longName", resolved_id)
+                break
+        self.store.add(dm_tab, "tracert", f"TRACEROUTE → {display_name}  waiting…")
+        self._refresh_log()
+        pid = self.mesh.send_traceroute(resolved_id)
+        if pid is not None:
+            self.mesh._traceroute_sessions[pid] = (resolved_id, time.time(), dm_tab)
+            self.store.add(dm_tab, "tracert", f"sent  packet_id={pid}")
+        else:
+            self.store.add(dm_tab, "tracert", "✗ traceroute send failed (not connected?)")
+        self._refresh_log()
+
+    def _cmd_dm(self, args):
+        target = " ".join(args).strip()
+        if not target:
+            self.store.add("system", "sys", "Usage: :dm <name/id/index>")
+            self._refresh_log()
+            return
+        resolved_id = self._resolve_node(target)
+        self._open_dm_tab(resolved_id)
+
+    def _cmd_clear(self, args):
+        self.store.clear(self.current_channel)
+        self.query_one("#log", RichLog).clear()
+        self._refresh_log()
+
+    def _cmd_help(self, args):
+        self._show_help_in_log()
+
+    _COMMANDS = {
+        "q": "_cmd_quit", "quit": "_cmd_quit", "exit": "_cmd_quit",
+        "close": "_cmd_close", "x": "_cmd_close",
+        "debug": "_cmd_debug",
+        "nodeclean": "_cmd_nodeclean",
+        "serial": "_cmd_serial",
+        "tcp": "_cmd_tcp",
+        "ch": "_cmd_ch",
+        "nodes": "_cmd_nodes",
+        "addfav": "_cmd_addfav",
+        "delfav": "_cmd_delfav",
+        "favs": "_cmd_favs",
+        "ping": "_cmd_ping",
+        "tracert": "_cmd_tracert", "traceroute": "_cmd_tracert",
+        "dm": "_cmd_dm",
+        "clear": "_cmd_clear",
+        "help": "_cmd_help", "?": "_cmd_help",
+    }
+
     def _handle_command(self, cmd: str):
         parts = cmd.strip().split(None, 2)
         verb = parts[0].lower() if parts else ""
         args = parts[1:] if len(parts) > 1 else []
-
-        if verb in ("q", "quit", "exit"):
-            self.exit()
-
-        elif verb in ("close", "x"):
-            self._close_current_dm()
-
-        elif verb == "nodeclean" and args:
-            try:
-                days = int(args[0])
-                self._run_node_clean(days)
-            except ValueError:
-                self.store.add("system", "sys", "Ошибка: укажите количество дней числом. Пример: :nodeclean 7")
-            self._refresh_log()
-
-        elif verb == "serial" and args:
-            port = args[0]
-            self.store.add("system", "sys", f"connecting serial {port}…")
-            ok = self.mesh.connect_serial(port)
-            if ok:
-                db.set_setting("conn_type", "serial")
-                db.set_setting("conn_target", port)
-                self.store.add("system", "sys", "serial link established and saved as default")
-            else:
-                self.store.add("system", "sys", "serial failed")
-            self._refresh_log()
-
-        elif verb == "tcp" and args:
-            host = args[0]
-            try:
-                port = int(args[1]) if len(args) > 1 else 4403
-            except ValueError:
-                self.store.add("system", "sys", "Ошибка: неверный порт.")
-                self._refresh_log()
-                return
-
-            self.store.add("system", "sys", f"connecting tcp {host}:{port}…")
-            ok = self.mesh.connect_tcp(host, port)
-            if ok:
-                db.set_setting("conn_type", "tcp")
-                db.set_setting("conn_target", f"{host}:{port}")
-                self.store.add("system", "sys", "tcp link established and saved as default")
-            else:
-                self.store.add("system", "sys", "tcp failed")
-            self._refresh_log()
-
-        elif verb == "ch" and args:
-            ch = args[0].lstrip("#").lower()
-            if ch not in self.channels:
-                idx = self.channels.index("system")
-                self.channels.insert(idx, ch)
-                self.store.load_history(ch)
-            self.ch_index = self.channels.index(ch)
-            self.store.add("system", "sys", f"switched to #{ch}")
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-            self._refresh_channel_bar()
-
-        elif verb == "nodes":
-            self.store.add("system", "sys", "=== node table ===")
-            self._node_index_map = {}
-            now = time.time()
-
-            sorted_nodes = sorted(
-                [(nid, info) for nid, info in self.mesh.nodes.items() if isinstance(info, dict)],
-                key=lambda x: x[1].get("lastHeard", 0)
-            )
-
-            total = len(sorted_nodes)
-            for idx_offset, (nid, info) in enumerate(sorted_nodes):
-                idx = total - idx_offset
-                str_nid = str(nid)
-                u = info.get("user", info)
-                name = u.get("longName", str_nid[-6:])
-                hw_model = u.get("hwModel", "?")
-                role = u.get("role", "?")
-
-                snr_val = info.get("snr", "?")
-                hops = info.get("hopsAway", "?")
-
-                pos = info.get("position", {})
-                lat = pos.get("latitude") or pos.get("latitudeI")
-                lon = pos.get("longitude") or pos.get("longitudeI")
-                if lat and lon:
-                    if abs(lat) > 180:
-                        lat = lat * 1e-7
-                        lon = lon * 1e-7
-                    pos_str = f"{lat:.4f},{lon:.4f}"
-                else:
-                    pos_str = "no gps"
-
-                last_heard = info.get("lastHeard", 0)
-                if last_heard and last_heard > 0:
-                    age_sec = int(now - last_heard)
-                    if age_sec < 60:
-                        heard_str = f"{age_sec}s ago"
-                    elif age_sec < 3600:
-                        heard_str = f"{age_sec // 60}m ago"
-                    elif age_sec < 86400:
-                        heard_str = f"{age_sec // 3600}h ago"
-                    else:
-                        heard_str = f"{age_sec // 86400}d ago"
-                else:
-                    heard_str = "never"
-
-                self._node_index_map[str(idx)] = str_nid
-                self.store.add(
-                    "system", "sys",
-                    f" [{idx}] {name:<20} id:{str_nid[-8:]}"
-                    f"  snr:{snr_val}  hops:{hops}"
-                    f"  hw:{hw_model}  role:{role}"
-                    f"  pos:{pos_str}  heard:{heard_str}"
-                )
-
-            self.ch_index = self.channels.index("system")
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-
-        elif verb == "addfav" and args:
-            target = args[0].strip()
-            resolved_id = None
-            label = "?"
-
-            if hasattr(self, "_node_index_map") and target in self._node_index_map:
-                resolved_id = self._node_index_map[target]
-
-            if not resolved_id:
-                for nid, info in self.mesh.nodes.items():
-                    str_nid = str(nid)
-                    if target.lstrip("!") in str_nid.lstrip("!"):
-                        resolved_id = str_nid
-                        break
-
-            if not resolved_id:
-                for nid, info in self.mesh.nodes.items():
-                    if isinstance(info, dict):
-                        ln = info.get("user", {}).get("longName", "")
-                        if ln.lower() == target.lower():
-                            resolved_id = str(nid)
-                            break
-
-            if not resolved_id:
-                self.store.add("system", "sys", f"✗ addfav: нода не найдена: {target}")
-                self._refresh_log()
-                return
-
-            node_info = self.mesh.nodes.get(resolved_id, {})
-            if isinstance(node_info, dict):
-                label = node_info.get("user", {}).get("longName", resolved_id)
-
-            self._favorites[resolved_id] = label
-            db.add_favorite(resolved_id, label)
-            self.store.add("system", "sys", f"★ Добавлено в избранное: {label} ({resolved_id})")
-            self._refresh_log()
-
-        elif verb == "delfav" and args:
-            target = args[0].strip()
-
-            found_id = None
-            for fid, flabel in self._favorites.items():
-                if target.lstrip("!") in fid.lstrip("!") or target.lower() == flabel.lower():
-                    found_id = fid
-                    break
-            if not found_id:
-                self.store.add("system", "sys", f"✗ delfav: не найдено в избранном: {target}")
-            else:
-                label = self._favorites.pop(found_id)
-                db.remove_favorite(found_id)
-                self.store.add("system", "sys", f"✩ Удалено из избранного: {label} ({found_id})")
-            self._refresh_log()
-
-        elif verb == "favs":
-            favs = self._favorites
-            if not favs:
-                self.store.add("system", "sys", "★ Избранных нод нет.")
-            else:
-                self.store.add("system", "sys", f"★ Избранные ноды ({len(favs)}):")
-                for fid, flabel in favs.items():
-                    self.store.add("system", "sys", f"   {flabel:<20} {fid}")
-            self.ch_index = self.channels.index("system")
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-
-        elif verb == "ping" and args:
-            target = " ".join(args).strip() if isinstance(args, list) else str(args).strip()
-            if not target:
-                self.store.add("system", "sys", "Usage: :ping <name/node_id/index>")
-                self._refresh_log()
-                return
-
-            resolved_id = None
-
-            if hasattr(self, '_node_index_map') and target in self._node_index_map:
-                resolved_id = _normalize_node_id(self._node_index_map[target])
-
-            if not resolved_id:
-                for nid, info in self.mesh.nodes.items():
-                    if isinstance(info, dict):
-                        ln = info.get("user", {}).get("longName", "")
-                        sn = info.get("user", {}).get("shortName", "")
-                        if ln.lower() == target.lower() or sn.lower() == target.lower():
-                            resolved_id = _normalize_node_id(str(nid))
-                            break
-
-            if not resolved_id:
-                resolved_id = _normalize_node_id(target) if target else target
-
-            dm_tab = f"▶{resolved_id}"
-            self._register_dm_tab(dm_tab)
-            self.ch_index = self.channels.index(dm_tab)
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-
-            display_name = resolved_id
-            for nid, info in self.mesh.nodes.items():
-                if _normalize_node_id(str(nid)) == resolved_id and isinstance(info, dict):
-                    display_name = info.get("user", {}).get("longName", resolved_id)
-                    break
-
-            self.store.add(dm_tab, "ping", f"PING → {display_name}  waiting…")
-            self._refresh_log()
-
-            pid = self.mesh.send_ping(resolved_id)
-            if pid is not None:
-                self.mesh._ping_sessions[pid] = (resolved_id, time.time(), dm_tab)
-                self.store.add(dm_tab, "ping", f"sent  packet_id={pid}")
-            else:
-                self.store.add(dm_tab, "ping", "✗ ping send failed (not connected?)")
-            self._refresh_log()
-
-        # ── TRACEROUTE COMMAND ──
-        elif verb in ("tracert", "traceroute") and args:
-            target = " ".join(args).strip() if isinstance(args, list) else str(args).strip()
-            if not target:
-                self.store.add("system", "sys", "Usage: :tracert <name/node_id/index>")
-                self._refresh_log()
-                return
-
-            resolved_id = None
-
-            if hasattr(self, '_node_index_map') and target in self._node_index_map:
-                resolved_id = _normalize_node_id(self._node_index_map[target])
-
-            if not resolved_id:
-                for nid, info in self.mesh.nodes.items():
-                    if isinstance(info, dict):
-                        ln = info.get("user", {}).get("longName", "")
-                        sn = info.get("user", {}).get("shortName", "")
-                        if ln.lower() == target.lower() or sn.lower() == target.lower():
-                            resolved_id = _normalize_node_id(str(nid))
-                            break
-
-            if not resolved_id:
-                resolved_id = _normalize_node_id(target) if target else target
-
-            dm_tab = f"▶{resolved_id}"
-            self._register_dm_tab(dm_tab)
-            self.ch_index = self.channels.index(dm_tab)
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-
-            display_name = resolved_id
-            for nid, info in self.mesh.nodes.items():
-                if _normalize_node_id(str(nid)) == resolved_id and isinstance(info, dict):
-                    display_name = info.get("user", {}).get("longName", resolved_id)
-                    break
-
-            self.store.add(dm_tab, "tracert", f"TRACEROUTE → {display_name}  waiting…")
-            self._refresh_log()
-
-            pid = self.mesh.send_traceroute(resolved_id)
-            if pid is not None:
-                self.mesh._traceroute_sessions[pid] = (resolved_id, time.time(), dm_tab)
-                self.store.add(dm_tab, "tracert", f"sent  packet_id={pid}")
-            else:
-                self.store.add(dm_tab, "tracert", "✗ traceroute send failed (not connected?)")
-            self._refresh_log()
-
-        # ── DM COMMAND ──
-        elif verb == "dm" and args:
-            target = " ".join(args).strip() if isinstance(args, list) else str(args).strip()
-            if not target:
-                self.store.add("system", "sys", "Usage: :dm <name/node_id/index>")
-                self._refresh_log()
-                return
-
-            resolved_id = None
-            if hasattr(self, '_node_index_map') and target in self._node_index_map:
-                resolved_id = _normalize_node_id(self._node_index_map[target])
-
-            if not resolved_id:
-                for nid, info in self.mesh.nodes.items():
-                    if isinstance(info, dict):
-                        current_long_name = info.get("user", {}).get("longName", "")
-                        current_short_name = info.get("user", {}).get("shortName", "")
-                        if current_long_name.lower() == target.lower() or current_short_name.lower() == target.lower():
-                            resolved_id = _normalize_node_id(str(nid))
-                            break
-
-            if not resolved_id: 
-                resolved_id = _normalize_node_id(target) if target else target
-
-            dm_tab = f"▶{resolved_id}"
-            self._register_dm_tab(dm_tab)
-
-            if dm_tab in self.channels:
-                self.ch_index = self.channels.index(dm_tab)
-            else:
-                self.store.add("system", "sys", f"Error: failed to switch to {dm_tab}")
-
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-
-        elif verb == "clear":
-            self.store.channels[self.current_channel].clear()
-            self.query_one("#log", RichLog).clear()
-            self._refresh_log()
-
-        elif verb in ("help", "?"):
-            self._show_help_in_log()
+        handler = self._COMMANDS.get(verb)
+        if handler:
+            getattr(self, handler)(args)
         else:
             self.store.add("system", "sys", f"unknown command: :{verb} — type :help")
             self._refresh_log()
-
         self._refresh_nodes()
+
 
     def _show_help_in_log(self):
         self.ch_index = self.channels.index("system")
@@ -2170,6 +2192,7 @@ class MeshApp(App):
             (":addfav <name/id/idx>", "add node to favorite"),
             (":delfav <name/id>",     "remove favorite node"),
             (":favs",                 "show favorite nodes"),
+            (":debug [on|off]",      "toggle raw packet logging"),
             (":q",               "quit"),
             ("ctrl+n",           "next channel"),
             ("ctrl+p",           "main menu (system tab)"),
@@ -2242,6 +2265,17 @@ class MeshApp(App):
         self._refresh_log()
         self._update_chat_view()
 
+    def action_jump_channel(self, index: int) -> None:
+        idx = int(index) - 1
+        if 0 <= idx < len(self.channels):
+            self.ch_index = idx
+            ch = self.current_channel
+            self._rendered_count[ch] = 0
+            self.query_one("#log", RichLog).clear()
+            self._refresh_log()
+            self._update_chat_view()
+            self._refresh_channel_bar()
+
     def action_main_menu(self):
         if "system" in self.channels:
             self.ch_index = self.channels.index("system")
@@ -2251,14 +2285,14 @@ class MeshApp(App):
         self._rendered_count[ch] = 0
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
-        self._update_chat_view() 
+        self._update_chat_view()
         self._refresh_channel_bar()
 
     def action_close_channel(self):
         self._close_current_dm()
 
     def action_clear_log(self):
-        self.store.channels[self.current_channel].clear()
+        self.store.clear(self.current_channel)
         self.query_one("#log", RichLog).clear()
         self._refresh_log()
 
@@ -2283,6 +2317,7 @@ def main():
     try:
         app.run()
     finally:
+        db.close()
         print("\033[?25h", end="")
         print("\033[0m", end="")
 
